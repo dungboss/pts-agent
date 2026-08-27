@@ -1,0 +1,27 @@
+# Secrets — tuyệt đối không commit
+.env
+telegram-bot.env
+
+# Runtime state / logs
+telegram-offset.json
+telegram-bot.log
+.cancel-flag
+telegram_bot.py.bak-*
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Harness sessions / temp
+.deepseek-sessions/
+.telegram-backup-*
+*.telegram-backup-*
+
+# 3 pipeline (script Photoshop) — giữ repo riêng, không đưa vào repo gốc
+tri-script/
+age-script/
+mockup-script/
