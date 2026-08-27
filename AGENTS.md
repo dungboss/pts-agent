@@ -69,3 +69,20 @@ find <output> -maxdepth 1 \( -name '._*' -o -name '*.sb-*' \) -delete
 Sau khi người dùng `/cancel`, **KHÔNG được tự chạy lại wrapper, không tự mở/activate
 Photoshop** (kể cả qua `osascript` hay `open`) — chỉ báo đã huỷ và chờ lệnh chạy mới
 từ người dùng.
+
+## Chạy local khi nguồn nằm trên NAS (tăng tốc)
+
+Khi template/design nằm trên NAS (config dùng `[NAS]/...`), **ĐỪNG** để Photoshop
+đọc/ghi trực tiếp qua WebDAV (rất chậm, ~10s/design). Thay vào đó làm 4 bước:
+
+1. **Tải về local** — copy template PSD + ảnh design từ NAS (mount `/Volumes/...`) vào
+   thư mục tạm `local-run/<pipeline>/` bằng `cp` (copy cả cây 1 lần, nhanh hơn đọc từng file).
+2. **Ghi config trỏ về local** — `templateFolder`/`designFolder`/`outputFolder` = đường
+   dẫn local tạm (KHÔNG dùng `[NAS]/...`).
+3. **Chạy script** với config local — Photoshop đọc/ghi đĩa local, nhanh ~5–10×.
+4. **Upload kết quả** từ local output lên NAS vào đúng thư mục `[NAS]/...` đã duyệt,
+   bằng WebDAV PUT (`curl -T` với credentials trong `.env`: `WEBDAV_USERNAME`,
+   `WEBDAV_PASSWORD`, `NAS_URL_1`).
+
+Sau khi upload xong và xác nhận đủ file, xoá thư mục `local-run/` tạm. Khi báo kết quả,
+ghi rõ "đã upload vào <đường dẫn NAS>".
