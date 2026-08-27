@@ -25,3 +25,6 @@ __pycache__/
 tri-script/
 age-script/
 mockup-script/
+
+# local-run temp (tải nguồn về chạy local)
+local-run/
