@@ -46,6 +46,12 @@ DATA_SOURCES = {
 
 PIPELINE_DIRS = {"tri": "tri-script", "age": "age-script", "mockup": "mockup-script"}
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
+IS_WINDOWS = os.name == "nt"
+
+
+def _curl_bin() -> str:
+    """curl.exe trên Windows (tránh alias PowerShell), curl trên macOS/Linux."""
+    return "curl.exe" if IS_WINDOWS else "curl"
 
 
 class FastPathError(Exception):
@@ -163,24 +169,30 @@ def _load_nas_env(script_dir: Path) -> Dict[str, str]:
 
 
 def _mount_point(script_dir: Path) -> str:
-    """Gọi nas-mount.sh, trả mount point (1 dòng)."""
+    """Trả gốc đường dẫn NAS — macOS: mount point (/Volumes/...), Windows: UNC/ổ đĩa."""
+    if IS_WINDOWS:
+        name = "nas-mount.bat"
+        cmd = ["cmd", "/c", name]
+    else:
+        name = "nas-mount.sh"
+        cmd = ["./" + name]
     proc = subprocess.run(
-        ["./nas-mount.sh"], cwd=str(script_dir), capture_output=True, text=True, timeout=240
+        cmd, cwd=str(script_dir), capture_output=True, text=True, errors="replace", timeout=240
     )
     if proc.returncode != 0:
-        raise FastPathError("Không mount được NAS: " + (proc.stderr.strip()[-400:] or "lỗi không rõ"))
+        raise FastPathError("Không kết nối được NAS: " + (proc.stderr.strip()[-400:] or "lỗi không rõ"))
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
     if not lines:
-        raise FastPathError("nas-mount.sh không trả mount point.")
+        raise FastPathError("%s không trả đường dẫn gốc." % name)
     return lines[-1]
 
 
 def _probe_webdav(url: str, user: str, pwd: str, timeout: int = 4) -> bool:
     proc = subprocess.run(
         [
-            "curl", "-sS", "--connect-timeout", str(timeout), "--max-time", str(timeout * 3),
+            _curl_bin(), "-sS", "--connect-timeout", str(timeout), "--max-time", str(timeout * 3),
             "-u", "%s:%s" % (user, pwd), "-X", "PROPFIND", "-H", "Depth: 0",
-            url, "-o", "/dev/null", "-w", "%{http_code}",
+            url, "-o", os.devnull, "-w", "%{http_code}",
         ],
         capture_output=True, text=True, timeout=timeout * 3 + 5,
     )
@@ -234,7 +246,7 @@ def _ensure_webdav_dir(base_url: str, rel: str, user: str, pwd: str) -> None:
     for part in rel.strip("/").split("/"):
         cur += "/" + part
         subprocess.run(
-            ["curl", "-sS", "-X", "MKCOL", "-u", "%s:%s" % (user, pwd), cur],
+            [_curl_bin(), "-sS", "-X", "MKCOL", "-u", "%s:%s" % (user, pwd), cur],
             capture_output=True, text=True, timeout=60,
         )
 
@@ -247,7 +259,7 @@ def _upload_pngs(local_dir: Path, base_url: str, rel: str, user: str, pwd: str) 
             continue
         url = "%s/%s/%s" % (base_url.rstrip("/"), rel.strip("/"), f.name)
         proc = subprocess.run(
-            ["curl", "-sS", "--fail", "-T", str(f), "-u", "%s:%s" % (user, pwd), url],
+            [_curl_bin(), "-sS", "--fail", "-T", str(f), "-u", "%s:%s" % (user, pwd), url],
             capture_output=True, text=True, timeout=120,
         )
         if proc.returncode != 0:
@@ -263,12 +275,25 @@ def _upload_pngs(local_dir: Path, base_url: str, rel: str, user: str, pwd: str) 
 def _resolve_path(value: str, script_dir: Path, mount_point: Optional[str]) -> str:
     if value.startswith("[NAS]"):
         if not mount_point:
-            raise FastPathError("Đường dẫn dùng [NAS] nhưng chưa có mount point.")
-        return str(Path(mount_point) / value[len("[NAS]"):].lstrip("/"))
+            raise FastPathError("Đường dẫn dùng [NAS] nhưng chưa có gốc NAS.")
+        rel = value[len("[NAS]"):].lstrip("/")
+        if IS_WINDOWS:
+            return mount_point.rstrip("\\/") + "\\" + rel.replace("/", "\\")
+        return str(Path(mount_point) / rel)
     p = Path(value).expanduser()
     if not p.is_absolute():
         p = (script_dir / p).resolve()
     return str(p)
+
+
+def _font_dir() -> Path:
+    """Thư mục font người dùng — macOS: ~/Library/Fonts, Windows: %LOCALAPPDATA%\\...\\Fonts."""
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "Microsoft" / "Windows" / "Fonts"
+        return Path.home() / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts"
+    return Path.home() / "Library" / "Fonts"
 
 
 def scan_rules(folder: Path) -> List[Dict]:
@@ -292,8 +317,8 @@ def scan_rules(folder: Path) -> List[Dict]:
 
 
 def install_fonts(folder: Path) -> List[str]:
-    """Copy font (.ttf/.otf/.ttc/.dfont) trong template → ~/Library/Fonts (macOS)."""
-    font_dir = Path.home() / "Library" / "Fonts"
+    """Copy font (.ttf/.otf/.ttc/.dfont) trong template → thư mục font người dùng."""
+    font_dir = _font_dir()
     font_dir.mkdir(parents=True, exist_ok=True)
     targets = [folder, folder / "fonts", folder / "Fonts"]
     installed: List[str] = []
@@ -320,8 +345,26 @@ def _count_png(folder: Path) -> int:
         return 0
 
 
+def _run_wrapper(script_dir: Path, config_path: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Chạy wrapper đúng theo OS: run-tri.bat (Windows) hoặc run-tri.sh (macOS)."""
+    if IS_WINDOWS:
+        cmd = ["cmd", "/c", "run-tri.bat", str(config_path)]
+    else:
+        cmd = ["./run-tri.sh", str(config_path)]
+    return subprocess.run(
+        cmd, cwd=str(script_dir), capture_output=True, text=True, errors="replace", timeout=timeout
+    )
+
+
 def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     """Chạy job tri và trả về báo cáo ngắn gọn. Không gọi LLM."""
+    if IS_WINDOWS:
+        return _run_windows(job, log)
+    return _run_macos(job, log)
+
+
+def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
+    """macOS: chạy local khi dùng NAS (tải template về → chạy → upload kết quả)."""
     def emit(msg: str) -> None:
         if log:
             log(msg)
@@ -401,13 +444,7 @@ def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
         emit("🚀 Chạy run-tri.sh (có thể mất nhiều phút)...")
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
         try:
-            proc = subprocess.run(
-                ["./run-tri.sh", str(config_path)],
-                cwd=str(script_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            proc = _run_wrapper(script_dir, config_path, timeout)
         except subprocess.TimeoutExpired:
             return "❌ Timeout — tri (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % timeout
 
@@ -444,6 +481,78 @@ def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     finally:
         if needs_nas:
             shutil.rmtree(LOCAL_RUN_DIR, ignore_errors=True)
+
+
+def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
+    """Windows: chạy trực tiếp qua run-tri.bat (SMB native nhanh, không cần local-run)."""
+    def emit(msg: str) -> None:
+        if log:
+            log(msg)
+
+    script_dir = ROOT / "tri-script"
+    template_in = job["templateFolder"]
+    output_in = job["outputFolder"]
+    needs_nas = template_in.startswith("[NAS]") or output_in.startswith("[NAS]")
+
+    emit("📋 Fast-path: phân tích lệnh (không qua AI)...")
+    mount_point = None
+    if needs_nas:
+        emit("🗂 NAS: kết nối (SMB/UNC hoặc WebDAV)...")
+        mount_point = _mount_point(script_dir)
+
+    template = _resolve_path(template_in, script_dir, mount_point)
+    output = _resolve_path(output_in, script_dir, mount_point)
+
+    rules = scan_rules(Path(template))
+    cfg = {
+        "source": job["source"],
+        "sourceLabel": job["sourceLabel"],
+        "templateFolder": template,
+        "outputFolder": output,
+        "outputFormula": job["outputFormula"],
+        "limit": job["limit"],
+        "rules": rules,
+    }
+    config_path = script_dir / ".fastpath-tri-config.json"
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    emit(
+        "✅ Config: %s | %d rule template | limit=%s | source=%s"
+        % (cfg["sourceLabel"], len(rules), cfg["limit"], cfg["source"])
+    )
+
+    if job.get("install_fonts"):
+        fonts = install_fonts(Path(template))
+        if fonts:
+            emit("🔤 Đã cài font: " + ", ".join(fonts))
+
+    emit("🚀 Chạy run-tri.bat (có thể mất nhiều phút)...")
+    timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
+    try:
+        proc = _run_wrapper(script_dir, config_path, timeout)
+    except subprocess.TimeoutExpired:
+        return "❌ Timeout — tri (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % timeout
+
+    done_path = script_dir / "tri-run.done"
+    status = ""
+    if done_path.is_file():
+        try:
+            status = done_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            status = "?"
+    count = _count_png(Path(output))
+    tail = (proc.stdout or "").strip()[-1200:]
+
+    success = proc.returncode == 0 and status == "OK"
+    report_output = output_in if output_in.startswith("[NAS]") else output
+    lines = []
+    if success:
+        lines.append("✅ Xong — tri: %d ảnh, exit OK." % count)
+    else:
+        lines.append("❌ Lỗi — tri (exit %s, done=%s)." % (proc.returncode, status or "MISSING"))
+    lines.append("Output: %s" % report_output)
+    if not success and tail:
+        lines.append("Log (cuối):\n" + tail)
+    return "\n".join(lines)
 
 
 def main(argv: List[str]) -> int:
