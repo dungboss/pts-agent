@@ -45,6 +45,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -325,6 +327,84 @@ def _load_nas_env(script_dir: Path) -> Dict[str, str]:
     return env
 
 
+class _ProcResult:
+    """Kết quả chạy lệnh (thay CompletedProcess) — có thêm cờ timed_out."""
+
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+
+    def __init__(
+        self,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        timed_out: bool = False,
+    ) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
+def _run_capture(cmd: List[str], cwd: Path, timeout: int) -> _ProcResult:
+    """Chạy lệnh, bắt output, timeout AN TOÀN (tránh kẹt worker vĩnh viễn).
+
+    stdout/stderr ghi vào FILE tạm thay vì pipe: `start` trong run-*.bat cho
+    Photoshop thừa kế pipe stdout/stderr và GIỮ pipe mở khiến communicate()
+    treo tới khi Photoshop thoát (đúng lỗi: job chạy xong nhưng worker không
+    chuyển sang job kế). File thì không bao giờ chặn — khi process con thoát,
+    wait() trả về ngay dù con cháu còn giữ handle.
+    Khi quá timeout: giết CẢ CÂY (taskkill /T /F) rồi trả kết quả lỗi thay vì treo.
+    """
+    creationflags = 0
+    if IS_WINDOWS:
+        # Không bật cửa sổ console chớp nhoáng khi chạy nas-mount/wrapper
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), stdout=out_f, stderr=err_f,
+            text=True, errors="replace", creationflags=creationflags,
+        )
+    except Exception:
+        out_f.close()
+        err_f.close()
+        raise
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if IS_WINDOWS:
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=30,
+                )
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+    out_f.seek(0)
+    err_f.seek(0)
+    out = out_f.read() or ""
+    err = err_f.read() or ""
+    out_f.close()
+    err_f.close()
+    return _ProcResult(
+        proc.returncode if proc.returncode is not None else 1,
+        out,
+        err,
+        timed_out,
+    )
+
+
 def _mount_point(script_dir: Path) -> str:
     """Trả gốc đường dẫn NAS — macOS: mount point (/Volumes/...), Windows: UNC/ổ đĩa."""
     if IS_WINDOWS:
@@ -333,9 +413,9 @@ def _mount_point(script_dir: Path) -> str:
     else:
         name = "nas-mount.sh"
         cmd = ["./" + name]
-    proc = subprocess.run(
-        cmd, cwd=str(script_dir), capture_output=True, text=True, errors="replace", timeout=240
-    )
+    proc = _run_capture(cmd, script_dir, 240)
+    if proc.timed_out:
+        raise FastPathError("Không kết nối được NAS (quá 240s — NAS chậm/ngắt kết nối?).")
     if proc.returncode != 0:
         raise FastPathError("Không kết nối được NAS: " + (proc.stderr.strip()[-400:] or "lỗi không rõ"))
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
@@ -547,12 +627,28 @@ def install_fonts(folder: Path) -> List[str]:
     return installed
 
 
-def _count_output(folder: Path, pipeline: str) -> int:
+def _count_output(folder: Path, pipeline: str, timeout: float = 20.0) -> int:
     exts = _output_exts(pipeline)
-    try:
-        return sum(1 for f in folder.iterdir() if f.suffix.lower() in exts)
-    except OSError:
+
+    def _count() -> int:
+        try:
+            return sum(1 for f in folder.iterdir() if f.suffix.lower() in exts)
+        except OSError:
+            return 0
+
+    # iterdir trên SMB có thể treo vô hạn khi NAS chậm/ngắt → đếm trong thread
+    # giới hạn thời gian, không chặn worker fast-path.
+    result: Dict[str, int] = {}
+
+    def _run() -> None:
+        result["n"] = _count()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
         return 0
+    return result.get("n", 0)
 
 
 def _build_config(job: Dict, resolved: Dict[str, str], script_dir: Path) -> Dict:
@@ -601,15 +697,13 @@ def _config_summary(job: Dict, cfg: Dict) -> str:
     )
 
 
-def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: int) -> subprocess.CompletedProcess:
+def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: int) -> _ProcResult:
     """Chạy wrapper đúng theo OS: run-<pipeline>.bat (Windows) hoặc run-<pipeline>.sh (macOS)."""
     if IS_WINDOWS:
         cmd = ["cmd", "/c", "run-%s.bat" % pipeline, str(config_path)]
     else:
         cmd = ["./run-%s.sh" % pipeline, str(config_path)]
-    return subprocess.run(
-        cmd, cwd=str(script_dir), capture_output=True, text=True, errors="replace", timeout=timeout
-    )
+    return _run_capture(cmd, script_dir, timeout)
 
 
 def _restart_photoshop() -> None:
@@ -618,15 +712,17 @@ def _restart_photoshop() -> None:
         try:
             subprocess.run(
                 ["taskkill", "/IM", "Photoshop.exe", "/F"],
-                capture_output=True, text=True, timeout=60,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
             )
         except subprocess.TimeoutExpired:
             pass
         time.sleep(4)
         try:
+            # KHÔNG capture output: `start` cho Photoshop thừa kế pipe stdout/stderr
+            # → subprocess.run đợi pipe đóng = đợi tới khi Photoshop thoát (treo).
             subprocess.run(
                 ["cmd", "/c", "start", "", "Photoshop.exe"],
-                capture_output=True, text=True, timeout=60,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
             )
         except subprocess.TimeoutExpired:
             pass
@@ -754,9 +850,8 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
 
         emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
-        try:
-            proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-        except subprocess.TimeoutExpired:
+        proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+        if proc.timed_out:
             return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
 
         status = ""
@@ -846,9 +941,8 @@ def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
 
     emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
     timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
-    try:
-        proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-    except subprocess.TimeoutExpired:
+    proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+    if proc.timed_out:
         return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
 
     status = ""

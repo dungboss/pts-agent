@@ -768,6 +768,46 @@ class DeepSeekAgent:
 FASTPATH_QUEUE: "queue.Queue[Tuple[TelegramAPI, int, Dict[str, Any]]]" = queue.Queue()
 _fastpath_running: Optional[str] = None  # pipeline fast-path đang chạy (None = rảnh)
 _fastpath_state_lock = threading.Lock()
+# Queue fast-path được lưu thêm trên đĩa để restart bot KHÔNG mất job đang chờ.
+FASTPATH_QUEUE_FILE = ROOT / ".fastpath-queue.json"
+
+
+def _fp_queue_load() -> List[Dict[str, Any]]:
+    """Đọc job fast-path còn chờ đã lưu trên đĩa (để nạp lại sau khi restart)."""
+    try:
+        data = json.loads(FASTPATH_QUEUE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [
+        e for e in data
+        if isinstance(e, dict) and isinstance(e.get("chat_id"), int)
+        and isinstance(e.get("job"), dict) and "pipeline" in e["job"]
+    ]
+
+
+def _fp_queue_save(entries: List[Dict[str, Any]]) -> None:
+    try:
+        FASTPATH_QUEUE_FILE.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # không ghi được cũng không làm sập bot
+
+
+def _fp_queue_append(chat_id: int, job: Dict[str, Any]) -> None:
+    """Ghi job mới vào file chờ (gọi TRƯỚC khi put vào queue trong bộ nhớ)."""
+    with _fastpath_state_lock:
+        entries = _fp_queue_load()
+        entries.append({"chat_id": chat_id, "job": job})
+        _fp_queue_save(entries)
+
+
+def _fp_queue_pop_first() -> None:
+    """Bỏ job đầu tiên khỏi file chờ — job đã chuyển sang trạng thái đang chạy."""
+    with _fastpath_state_lock:
+        entries = _fp_queue_load()
+        if entries:
+            _fp_queue_save(entries[1:])
 
 
 def _fastpath_worker() -> None:
@@ -775,6 +815,7 @@ def _fastpath_worker() -> None:
     global _fastpath_running
     while True:
         api, chat_id, job = FASTPATH_QUEUE.get()
+        _fp_queue_pop_first()  # job này bắt đầu chạy — bỏ khỏi file chờ
         with _fastpath_state_lock:
             _fastpath_running = job["pipeline"]
         try:
@@ -797,6 +838,8 @@ def clear_fastpath_queue() -> int:
             cleared += 1
         except queue.Empty:
             break
+    with _fastpath_state_lock:
+        _fp_queue_save([])  # đồng bộ cả file chờ trên đĩa
     return cleared
 
 
@@ -915,6 +958,9 @@ def handle_update(
                     CANCEL_FLAG.unlink()
             except OSError:
                 pass
+            # Lưu xuống đĩa TRƯỚC khi vào queue bộ nhớ: nếu bot chết/restart giữa
+            # chừng thì job vẫn được nạp lại khi khởi động, không bị mất.
+            _fp_queue_append(chat_id, job)
             FASTPATH_QUEUE.put((api, chat_id, job))
             with _fastpath_state_lock:
                 pos = FASTPATH_QUEUE.qsize() + (1 if _fastpath_running else 0)
@@ -995,6 +1041,13 @@ def main() -> int:
 
     # Worker chạy tuần tự các job fast-path (mỗi lần 1 job)
     threading.Thread(target=_fastpath_worker, daemon=True).start()
+
+    # Nạp lại job fast-path còn chờ từ lần chạy trước (queue có lưu trên đĩa)
+    reloaded = _fp_queue_load()
+    for entry in reloaded:
+        FASTPATH_QUEUE.put((api, entry["chat_id"], entry["job"]))
+    if reloaded:
+        logging.info("Fast-path: nạp lại %d job đang chờ từ %s", len(reloaded), FASTPATH_QUEUE_FILE.name)
 
     while True:
         try:

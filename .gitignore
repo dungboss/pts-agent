@@ -9,6 +9,7 @@ telegram-ca.pem
 telegram-offset.json
 telegram-bot.log
 .cancel-flag
+.fastpath-queue.json
 telegram_bot.py.bak-*
 .reasonix/
 
