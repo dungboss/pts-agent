@@ -38,12 +38,14 @@ kết quả lên NAS bằng WebDAV PUT (`curl -T`).
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -610,6 +612,50 @@ def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: in
     )
 
 
+def _restart_photoshop() -> None:
+    """Quit rồi mở lại Photoshop sau mỗi lần chạy (tránh kẹt / đầy RAM)."""
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", "Photoshop.exe", "/F"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(4)
+        try:
+            subprocess.run(
+                ["cmd", "/c", "start", "", "Photoshop.exe"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        return
+
+    # macOS: tìm bundle .app (giống wrapper run-*.sh, tránh lấy nhầm thư mục cài đặt)
+    candidates = sorted(
+        glob.glob("/Applications/Adobe Photoshop*.app")
+        + glob.glob("/Applications/*/Adobe Photoshop*.app")
+    )
+    if not candidates:
+        return
+    ps_app = Path(candidates[-1]).stem  # vd "Adobe Photoshop 2025"
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "%s" to quit' % ps_app],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(4)
+    try:
+        subprocess.run(
+            ["open", "-a", ps_app], capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     """Chạy job pipeline (tri/age/mockup) và trả về báo cáo ngắn gọn. Không gọi LLM."""
     if IS_WINDOWS:
@@ -741,6 +787,11 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
         lines.append("Output: %s" % report_output)
         if not success and proc.returncode not in (0, 130) and tail:
             lines.append("Log (cuối):\n" + tail)
+
+        # Restart Photoshop sau mỗi lần chạy (trừ khi bị huỷ) để tránh kẹt / đầy RAM
+        if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
+            _restart_photoshop()
+
         return "\n".join(lines)
     finally:
         if needs_nas:
@@ -818,6 +869,11 @@ def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     lines.append("Output: %s" % report_output)
     if not success and tail:
         lines.append("Log (cuối):\n" + tail)
+
+    # Restart Photoshop sau mỗi lần chạy (trừ khi bị huỷ)
+    if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
+        _restart_photoshop()
+
     return "\n".join(lines)
 
 
