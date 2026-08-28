@@ -18,6 +18,7 @@ __pycache__/
 
 # Harness sessions / temp
 .deepseek-sessions/
+.deepseek-sessions-backup/
 .telegram-backup-*
 *.telegram-backup-*
 

@@ -37,6 +37,11 @@ try:
 except ImportError:
     DeepSeekHarness = None  # type: ignore[assignment]
 
+try:
+    import fast_run
+except Exception:  # noqa: BLE001 — fast-path là tùy chọn, không làm sập bot
+    fast_run = None  # type: ignore[assignment]
+
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
@@ -277,7 +282,7 @@ Workspace của bạn là project hiện tại. Ba pipeline là age-script, mock
 
 Cách hỏi: đưa thẳng các câu hỏi cần trả lời, ngắn gọn, đánh số. KHÔNG mở đầu bằng lời giải thích dài dòng kiểu "Chưa chạy được vì thiếu config...", "theo hướng dẫn AGENTS.md tôi bắt buộc phải hỏi", và KHÔNG liệt kê mục "Tình trạng hiện tại" trước câu hỏi.
 
-Bạn có thể dùng các tool local của Harness trong workspace để đọc file, xem log và chạy wrapper. Chỉ chạy run-age.sh/run-mockup.sh/run-tri.sh sau khi người dùng xác nhận; không chạy shell tùy ý ngoài phạm vi project. Nếu người dùng gửi sẵn đầy đủ cấu hình (template, nguồn, output, limit…) trong tin nhắn, hãy ghi config rồi chạy wrapper NGAY — không đọc lại AGENTS.md, không ls/khám phá thêm, không hỏi lại. Nếu người dùng chỉ hỏi chuyện thông thường, trả lời tự nhiên. Khi job hoàn tất, chỉ báo NGẮN GỌN (1–3 dòng): ✅/❌ + tên pipeline + số ảnh đã xử lý (x/tổng) + exit code/done + đường dẫn output. KHÔNG viết dài dòng, KHÔNG thêm mục "lưu ý nhỏ" / "sự cố gặp phải" — chỉ nêu lỗi/ghi chú khi có lỗi thật sự hoặc người dùng yêu cầu chi tiết. Sau mỗi lần chạy xong, xoá các file tạm (._* và *.sb-*) trong thư mục output. Sau khi người dùng /cancel, KHÔNG được tự chạy lại wrapper, không tự mở/activate Photoshop (kể cả qua osascript hay open) — chỉ báo đã huỷ và chờ lệnh mới. Nếu nguồn (template/design) nằm trên NAS, hãy tải về local trước rồi chạy local, sau đó upload kết quả lên NAS — không để Photoshop đọc/ghi trực tiếp qua WebDAV.
+Bạn có thể dùng các tool local của Harness trong workspace để đọc file, xem log và chạy wrapper. Chỉ chạy run-age.sh/run-mockup.sh/run-tri.sh sau khi người dùng xác nhận; không chạy shell tùy ý ngoài phạm vi project. Nếu người dùng gửi sẵn đầy đủ cấu hình (template, nguồn, output, limit…) trong tin nhắn, hãy ghi config rồi chạy wrapper NGAY — không đọc lại AGENTS.md, không ls/khám phá thêm, không hỏi lại. Nếu người dùng chỉ hỏi chuyện thông thường, trả lời tự nhiên. Khi job hoàn tất, chỉ báo NGẮN GỌN (1–3 dòng): ✅/❌ + tên pipeline + số ảnh đã xử lý (x/tổng) + exit code/done + đường dẫn output. KHÔNG viết dài dòng, KHÔNG thêm mục "lưu ý nhỏ" / "sự cố gặp phải" — chỉ nêu lỗi/ghi chú khi có lỗi thật sự hoặc người dùng yêu cầu chi tiết. Sau mỗi lần chạy xong, xoá các file tạm (._* và *.sb-*) trong thư mục output. Sau khi người dùng /cancel, KHÔNG được tự chạy lại wrapper, không tự mở/activate Photoshop (kể cả qua osascript hay open) — chỉ báo đã huỷ và chờ lệnh mới. Nếu nguồn (template/design) nằm trên NAS, hãy tải về local trước rồi chạy local, sau đó upload kết quả lên NAS — không để Photoshop đọc/ghi trực tiếp qua WebDAV. Với lệnh chạy tri đã đủ config (template/output/formula/limit), ưu tiên gọi ./run-pipeline.sh "<toàn bộ lệnh>" để chạy gộp trong 1 bước thay vì gọi nhiều tool.
 """
 
 
@@ -327,13 +332,19 @@ class DeepSeekAgent:
             self._make_harness()
             self._harness_dead = False
 
-    def hard_cancel(self) -> None:
+    def hard_cancel(self, chat_id: int) -> None:
         """Dừng ngay lượt agent hiện tại bằng cách đóng harness runtime (dùng cho /cancel)."""
         self._harness_dead = True
         try:
             self.harness.close()
         except Exception:
             pass
+        # Đóng runtime giữa lượt chạy có thể làm log session bị ngắt giữa chừng (torn).
+        # Bỏ id session cũ khi chat đang bận để lệnh kế tiếp tạo session mới, tránh
+        # lỗi "id collision" khi resume log hỏng.
+        with self.state_lock:
+            if chat_id in self.busy_chats:
+                self.session_ids[chat_id] = "telegram-%s-%s" % (chat_id, int(time.time()))
 
     def submit(self, chat_id: int, text: str) -> None:
         # Tin nhắn mới từ người dùng → bỏ cờ huỷ cũ (lần chạy hợp lệ kế tiếp sẽ chạy bình thường).
@@ -435,6 +446,49 @@ class DeepSeekAgent:
                 self.telegram_api.send_message(chat_id, "DeepSeek Harness gặp lỗi: %s" % exc)
 
 
+FASTPATH_LOCK = threading.Lock()
+
+
+def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
+    """Chạy job pipeline theo fast-path (không qua LLM) trong thread nền."""
+    if not FASTPATH_LOCK.acquire(blocking=False):
+        api.send_message(chat_id, "⏳ Đang có job pipeline khác chạy — hãy chờ xong rồi gửi lại.")
+        return
+    stop_progress = threading.Event()
+    interval = env_int("TELEGRAM_PROGRESS_INTERVAL_SEC", 300, 10)
+    started = time.time()
+
+    def _progress_loop() -> None:
+        while not stop_progress.wait(interval):
+            message = _progress_message()
+            if message is None:
+                continue
+            elapsed = int(time.time() - started) // 60
+            try:
+                api.send_message(chat_id, "📊 %s (đã %d phút)" % (message, elapsed))
+            except Exception:
+                logging.exception("Fast-path progress send failed")
+
+    progress_thread = threading.Thread(target=_progress_loop, daemon=True)
+    progress_thread.start()
+    try:
+        def send(msg: str) -> None:
+            try:
+                for chunk in split_message(msg):
+                    api.send_message(chat_id, chunk)
+            except Exception:
+                logging.exception("Fast-path gửi Telegram lỗi")
+
+        report = fast_run.run_job(job, log=send)
+        for chunk in split_message(report):
+            api.send_message(chat_id, chunk)
+    except fast_run.FastPathError as exc:
+        api.send_message(chat_id, "⚠️ Fast-path không chạy được: %s\nBạn có thể gửi lại để agent xử lý." % exc)
+    finally:
+        stop_progress.set()
+        FASTPATH_LOCK.release()
+
+
 def save_offset(offset: int) -> None:
     OFFSET_FILE.write_text(json.dumps({"offset": offset}), encoding="utf-8")
 
@@ -488,7 +542,7 @@ def handle_update(
         except OSError:
             pass
         if ai_agent is not None:
-            ai_agent.hard_cancel()
+            ai_agent.hard_cancel(chat_id)
         stopped = cancel_running_script()
         threading.Thread(target=_photoshop_watchdog, daemon=True).start()
         cleared = ai_agent.clear_queue(chat_id) if ai_agent is not None else 0
@@ -500,6 +554,12 @@ def handle_update(
             parts.append("Đã bỏ %d việc đang xếp hàng." % cleared)
         api.send_message(chat_id, " ".join(parts))
         return
+    if fast_run is not None:
+        job = fast_run.parse_job(text)
+        if job is not None:
+            api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
+            threading.Thread(target=_run_fastpath, args=(api, chat_id, job), daemon=True).start()
+            return
     if ai_agent is None:
         api.send_message(chat_id, "Chưa cấu hình DEEPSEEK_API_KEY hoặc deepseek-harness-sdk nên agent chưa hoạt động.")
         return
