@@ -2,11 +2,15 @@
 .env
 telegram-bot.env
 
+# Root CA bổ sung cho Telegram (chứa khóa công khai, nhưng giữ local như .env)
+telegram-ca.pem
+
 # Runtime state / logs
 telegram-offset.json
 telegram-bot.log
 .cancel-flag
 telegram_bot.py.bak-*
+.reasonix/
 
 # macOS
 .DS_Store
@@ -21,6 +25,10 @@ __pycache__/
 .deepseek-sessions-backup/
 .telegram-backup-*
 *.telegram-backup-*
+.telegram-owner.json
+
+# SDK runtime (npm closure) — chỉ commit package.json + cordis.yml + README
+sdk-runtime/node_modules/
 
 # 3 pipeline (script Photoshop) — giữ repo riêng, không đưa vào repo gốc
 tri-script/

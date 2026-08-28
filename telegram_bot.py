@@ -21,7 +21,9 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -48,6 +50,12 @@ ENV_FILE = ROOT / ".env"
 OFFSET_FILE = ROOT / "telegram-offset.json"
 CANCEL_FLAG = ROOT / ".cancel-flag"
 MAX_MESSAGE_LENGTH = 3900
+# Some installs/OS trust stores lack the GoDaddy root that api.telegram.org uses.
+# When present, trust only this one extra root (kept out of git) — no other
+# sites' TLS verification changes.
+# Verified 2026-08-27 against https://certs.godaddy.com/repository/gdroot-g2.crt
+CA_FILE = ROOT / "telegram-ca.pem"
+GODADDY_ROOT_G2_FP = "45:14:0B:32:47:EB:9C:C8:C5:B4:F0:D7:B5:30:91:F7:32:92:08:9E:6E:5A:63:E2:74:9D:D3:AC:A9:19:8E:DA"
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -77,6 +85,35 @@ class TelegramAPI:
     def __init__(self, token: str, request_timeout: int = 40) -> None:
         self.base_url = "https://api.telegram.org/bot" + token + "/"
         self.request_timeout = request_timeout
+        self.ssl_context = self._build_ssl_context()
+
+    @staticmethod
+    def _build_ssl_context() -> Optional[ssl.SSLContext]:
+        """System trust, plus the pinned GoDaddy root when telegram-ca.pem is present."""
+        ctx = ssl.create_default_context()
+        if not CA_FILE.is_file():
+            return ctx
+        try:
+            data = CA_FILE.read_bytes()
+        except OSError:
+            logging.getLogger(__name__).warn("Cannot read %s; using system trust only", CA_FILE)
+            return ctx
+        try:
+            cert = ssl.PEM_cert_to_DER_cert(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            logging.getLogger(__name__).warn("Invalid CA file %s (%s); using system trust only", CA_FILE, exc)
+            return ctx
+        import hashlib
+        fp = ":".join("%02X" % b for b in hashlib.sha256(cert).digest())
+        if fp != GODADDY_ROOT_G2_FP:
+            logging.getLogger(__name__).warn("CA file %s does not match pinned GoDaddy root; ignoring", CA_FILE)
+            return ctx
+        try:
+            ctx.load_verify_locations(cadata=data.decode("utf-8"))
+            return ctx
+        except ssl.SSLError as exc:
+            logging.getLogger(__name__).warn("Cannot use %s (%s); using system trust only", CA_FILE, exc)
+            return ctx
 
     def call(self, method: str, payload: Optional[Dict[str, Any]] = None) -> Any:
         data = json.dumps(payload or {}).encode("utf-8")
@@ -87,7 +124,7 @@ class TelegramAPI:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.request_timeout, context=self.ssl_context) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise RuntimeError("Telegram API %s failed: %s" % (method, exc)) from exc
@@ -171,7 +208,15 @@ def _detect_running_project() -> Optional[str]:
         if mtime > best_mtime:
             best_mtime = mtime
             best_key = key
-    return best_key
+    if best_key is not None:
+        return best_key
+    # Fallback: wrapper process đang chạy nhưng log chưa có / log cũ (vd Photoshop
+    # mới khởi động, hoặc wrapper kẹt poll). Vẫn báo là script đang chạy.
+    for line in _running_wrapper_cmdlines():
+        for key in PROJECTS:
+            if re.search(r"run-%s" % re.escape(key), line):
+                return key
+    return None
 
 
 def _progress_message() -> Optional[str]:
@@ -184,7 +229,7 @@ def _progress_message() -> Optional[str]:
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return None
+        return "%s đang chạy." % project["label"]
     matches = re.findall(r"PROGRESS (\d+)/(\d+)", text)
     if not matches:
         return "%s đang chạy." % project["label"]
@@ -207,6 +252,68 @@ def _pgrep(pattern: str) -> List[int]:
     return [int(p) for p in out.split() if p.strip().isdigit()]
 
 
+def _running_wrapper_cmdlines() -> List[str]:
+    """Command lines của tiến trình wrapper đang chạy (run-*.sh / run-*.bat).
+
+    Dùng để phát hiện script đang chạy kể cả khi log pipeline chưa có (vd Photoshop
+    mới khởi động) hoặc log bị giết giữa chừng. Chỉ soi cmd.exe/bash.exe để tránh
+    nhầm với chính lệnh kiểm tra của người dùng/agent.
+    """
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe' or Name='bash.exe'\" | "
+                    "Where-Object { $_.CommandLine -match 'run-(tri|age|mockup)' } | "
+                    "ForEach-Object { $_.CommandLine }",
+                ],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [line for line in out.splitlines() if line.strip()]
+    try:
+        out = subprocess.run(["pgrep", "-af", "run-(tri|age|mockup)"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def _windows_pids_matching(regex: str, name_only: bool = False) -> List[int]:
+    """Windows: PID của process khớp regex (Name hoặc CommandLine).
+
+    name_only=True → chỉ soi tên process (dùng cho Photoshop.exe, tránh nhầm với
+    lệnh kiểm tra của người dùng có chứa chữ 'Photoshop' trong command line).
+    """
+    safe = regex.replace("'", "''")
+    if name_only:
+        cond = "$_.Name -match '%s'" % safe
+    else:
+        cond = "$_.Name -match '%s' -or $_.CommandLine -match '%s'" % (safe, safe)
+    script = (
+        "Get-CimInstance Win32_Process | Where-Object { %s } | "
+        "ForEach-Object { $_.ProcessId }" % cond
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(p) for p in out.split() if p.strip().isdigit()]
+
+
+def _kill_windows_pids(pids: List[int]) -> None:
+    """Windows: kill process kèm cây con (taskkill /T /F) — /T để diệt cả script con."""
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def _kill_pids(pids: List[int], sig: int) -> None:
     for pid in pids:
         try:
@@ -218,6 +325,23 @@ def _kill_pids(pids: List[int], sig: int) -> None:
 def cancel_running_script() -> List[str]:
     """Dừng wrapper, osascript và Photoshop (JSX chạy bên trong Photoshop)."""
     stopped = []
+    if sys.platform == "win32":
+        # Wrapper (cmd/bash chạy run-*.bat) + JSX chạy BÊN TRONG Photoshop
+        # → phải dừng Photoshop mới dừng được script thật sự.
+        for key in ("tri", "age", "mockup"):
+            pids = _windows_pids_matching(r"run-%s" % key)
+            if pids:
+                _kill_windows_pids(pids)
+                stopped.append(key)
+        ps_pids = _windows_pids_matching(r"^Photoshop\.exe$", name_only=True)
+        if ps_pids:
+            _kill_windows_pids(ps_pids)
+            time.sleep(2)
+            still = _windows_pids_matching(r"^Photoshop\.exe$", name_only=True)
+            if still:
+                _kill_windows_pids(still)
+            stopped.append("Photoshop")
+        return stopped
     for pattern in WRAPPER_PATTERNS + OSASCRIPT_PATTERNS:
         pids = _pgrep(pattern)
         if not pids:
@@ -245,10 +369,149 @@ def _photoshop_watchdog() -> None:
     while time.time() < deadline:
         if not CANCEL_FLAG.exists():
             return
-        ps_pids = _pgrep(PHOTOSHOP_PATTERN)
-        if ps_pids:
-            _kill_pids(ps_pids, signal.SIGKILL)
+        if sys.platform == "win32":
+            ps_pids = _windows_pids_matching(r"^Photoshop\.exe$", name_only=True)
+            if ps_pids:
+                _kill_windows_pids(ps_pids)
+        else:
+            ps_pids = _pgrep(PHOTOSHOP_PATTERN)
+            if ps_pids:
+                _kill_pids(ps_pids, signal.SIGKILL)
         time.sleep(3)
+
+
+OWNER_FILE = ROOT / ".telegram-owner.json"
+
+
+def _load_last_owner() -> Optional[int]:
+    """Chat nhận update gần nhất (để sau khi restart bot, script đang chạy vẫn có người nhận update)."""
+    try:
+        return int(json.loads(OWNER_FILE.read_text(encoding="utf-8")).get("chat_id"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _save_last_owner(chat_id: int) -> None:
+    try:
+        OWNER_FILE.write_text(json.dumps({"chat_id": chat_id}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _cleanup_pipeline_temp(key: str) -> None:
+    """Xoá file tạm Photoshop ở top-level thư mục output sau khi pipeline chạy xong.
+
+    Khớp với hướng dẫn 'Dọn file tạm' trong AGENTS.md: xoá `._*` (AppleDouble của
+    macOS khi ghi lên NAS) và `*.sb-*` (file tạm 0 byte của Save-for-Web).
+    Output lấy từ `. <key>-config-resolved.json` (đường dẫn thật, [NAS] đã thay);
+    không resolve được thì bỏ qua, không đoán đường dẫn.
+    """
+    project = PROJECTS[key]
+    pdir = _project_dir(project)
+    output: Any = None
+    try:
+        resolved = pdir / (".%s-config-resolved.json" % key)
+        if resolved.is_file():
+            output = json.loads(resolved.read_text(encoding="utf-8")).get("outputFolder")
+    except (OSError, ValueError):
+        pass
+    if not output:
+        try:
+            base = pdir / ("%s-config.json" % key)
+            if base.is_file():
+                output = json.loads(base.read_text(encoding="utf-8")).get("outputFolder")
+        except (OSError, ValueError):
+            pass
+    if not output or "[NAS]" in str(output):
+        return
+    out = Path(str(output))
+    if not out.is_absolute():
+        out = pdir / out
+    if not out.is_dir():
+        return
+    removed = 0
+    try:
+        for entry in out.iterdir():
+            if not entry.is_file():
+                continue
+            if entry.name.startswith("._") or ".sb-" in entry.name:
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        return
+    if removed:
+        logging.info("Đã dọn %d file tạm Photoshop trong %s", removed, out)
+
+
+def _start_progress_monitor(ai_agent: "DeepSeekAgent") -> None:
+    """Thread nền: khi có script pipeline đang chạy, mỗi TELEGRAM_PROGRESS_INTERVAL_SEC
+    gửi 1 tin cập nhật trạng thái (📊 ...) tới chat chủ.
+
+    Hoạt động độc lập với lượt agent — kể cả khi lượt đã kết thúc mà script vẫn
+    chạy nền (runtime restart / bash tool trả về sớm), update vẫn được gửi.
+    """
+    interval = env_int("TELEGRAM_PROGRESS_INTERVAL_SEC", 300, 10)
+    check_every = max(10, min(interval, 60))
+    state: Dict[str, Any] = {"project": None, "owner": None, "started": 0.0, "last_sent": 0.0}
+
+    def _pick_owner() -> Optional[int]:
+        busy = list(ai_agent.busy_chats)
+        if len(busy) == 1:
+            return busy[0]
+        chats = list(ai_agent.session_ids)
+        if len(chats) == 1:
+            return chats[0]
+        return _load_last_owner()
+
+    def _loop() -> None:
+        cleaned_done: Dict[str, float] = {}
+        while True:
+            try:
+                now = time.time()
+                key = _detect_running_project()
+                # 1) Dọn file tạm: pipeline nào vừa ghi *.done (run xong) → dọn output
+                #    một lần cho từng run (theo mtime của done). Chạy thread riêng để
+                #    không block vòng lặp khi output là NAS chậm/không với tới.
+                for pkey, project in PROJECTS.items():
+                    done_path = _project_dir(project) / project["done"]
+                    try:
+                        mtime = done_path.stat().st_mtime
+                    except OSError:
+                        continue
+                    if cleaned_done.get(pkey) != mtime:
+                        cleaned_done[pkey] = mtime
+                        threading.Thread(target=_cleanup_pipeline_temp, args=(pkey,), daemon=True).start()
+                # 2) Update trạng thái mỗi 5 phút khi có script chạy
+                if key is None:
+                    state["project"] = None
+                    state["owner"] = None
+                    state["last_sent"] = 0.0
+                else:
+                    if state["project"] != key:
+                        # Script mới bắt đầu (hoặc đổi pipeline) — ghi nhớ chat chủ.
+                        state["project"] = key
+                        state["started"] = now
+                        state["last_sent"] = now
+                        state["owner"] = _pick_owner()
+                    owner = state["owner"]
+                    if owner is not None:
+                        elapsed = now - state["started"]
+                        if elapsed >= interval and now - state["last_sent"] >= interval:
+                            message = _progress_message()
+                            if message:
+                                ai_agent.telegram_api.send_message(
+                                    owner, "📊 %s (đã %d phút)" % (message, int(elapsed) // 60)
+                                )
+                                state["last_sent"] = now
+                                _save_last_owner(owner)
+            except Exception:
+                logging.exception("Progress monitor error")
+            time.sleep(check_every)
+
+    threading.Thread(target=_loop, daemon=True, name="progress-monitor").start()
 
 
 def status_message(ai_agent: Optional["DeepSeekAgent"], chat_id: int) -> str:
@@ -286,6 +549,21 @@ Bạn có thể dùng các tool local của Harness trong workspace để đọc
 """
 
 
+def _is_collision_error(result: Any) -> bool:
+    """True khi turn kết thúc bằng lỗi id collision (runtime mới không nhận session cũ)."""
+    if getattr(result, "finish_reason", None) != "error":
+        return False
+    for event in reversed(getattr(result, "events", None) or []):
+        if event.get("type") != "turn/end":
+            continue
+        data = event.get("data") or {}
+        reason = data.get("reason") if isinstance(data, dict) else None
+        error = reason.get("error") if isinstance(reason, dict) else None
+        if isinstance(error, dict) and "id collision" in str(error.get("message", "")):
+            return True
+    return False
+
+
 class DeepSeekAgent:
     def __init__(
         self,
@@ -309,11 +587,38 @@ class DeepSeekAgent:
         self.run_lock = threading.Lock()
         self.busy_chats: Set[int] = set()
         self._harness_dead = False
+        self._session_generation = 0
         self._make_harness()
+
+    def _next_session_id(self, chat_id: int) -> str:
+        return "telegram-%s-%s-g%d" % (chat_id, self.instance_id, self._session_generation)
 
     def _make_harness(self) -> None:
         session_root = ROOT / ".deepseek-sessions"
         session_root.mkdir(parents=True, exist_ok=True)
+        # deepseek-harness-runtime-bin không có bản Windows nên phải chỉ rõ runtime
+        # Node (npm closure trong sdk-runtime/) qua launch_args_override + cordis.
+        runtime_dir = ROOT / "sdk-runtime"
+        packaged_bin = (
+            runtime_dir
+            / "node_modules"
+            / "@deepseek-ai"
+            / "dsh-sdk-jsonrpc-demo"
+            / "lib"
+            / "packaged-bin.js"
+        )
+        node = shutil.which("node")
+        if node is None or not packaged_bin.is_file():
+            raise RuntimeError(
+                "Thiếu DeepSeek Harness SDK runtime (sdk-runtime/ chưa cài). "
+                "Chạy: cd sdk-runtime && npm install"
+            )
+        env = {"DSH_SYSTEM_PROMPT": AGENT_INSTRUCTIONS}
+        # Git Bash cho tool bash (wrapper .sh); không có thì runtime vẫn chạy,
+        # nhưng agent không chạy được wrapper.
+        git_bin = r"C:\Program Files\Git\bin"
+        if os.path.isdir(git_bin) and git_bin not in os.environ.get("PATH", "").split(os.pathsep):
+            env["PATH"] = os.environ.get("PATH", "") + os.pathsep + git_bin
         self.harness = DeepSeekHarness(
             provider=os.environ.get("DSH_PROVIDER", "deepseek-official"),
             model=self._model,
@@ -323,9 +628,17 @@ class DeepSeekAgent:
             session_root=str(session_root),
             api_key=self._api_key,
             base_url=os.environ.get("DEEPSEEK_BASE_URL") or None,
-            env={"DSH_SYSTEM_PROMPT": AGENT_INSTRUCTIONS},
+            launch_args_override=(node, str(packaged_bin)),
+            cordis=str(runtime_dir / "cordis.yml"),
+            env=env,
             request_timeout_seconds=self._request_timeout,
         )
+        # Runtime mới không resume được session cũ đã lưu trên đĩa (id collision) —
+        # mỗi lần tạo harness mới phải dùng session id mới cho mọi chat.
+        self._session_generation += 1
+        with self.state_lock:
+            for chat_id in list(self.session_ids):
+                self.session_ids[chat_id] = self._next_session_id(chat_id)
 
     def _ensure_harness(self) -> None:
         if self._harness_dead:
@@ -399,30 +712,23 @@ class DeepSeekAgent:
         try:
             self.telegram_api.send_message(chat_id, "DeepSeek Harness đang xử lý...")
             with self.state_lock:
-                session_id = self.session_ids.setdefault(chat_id, "telegram-%s-%s" % (chat_id, self.instance_id))
-            stop_progress = threading.Event()
-            interval = env_int("TELEGRAM_PROGRESS_INTERVAL_SEC", 300, 10)
-            started = time.time()
-
-            def _progress_loop() -> None:
-                while not stop_progress.wait(interval):
-                    message = _progress_message()
-                    if message is None:
-                        continue
-                    elapsed = int(time.time() - started) // 60
-                    try:
-                        self.telegram_api.send_message(chat_id, "📊 %s (đã %d phút)" % (message, elapsed))
-                    except Exception:
-                        logging.exception("Cannot send progress to Telegram")
-
-            progress_thread = threading.Thread(target=_progress_loop, daemon=True)
-            progress_thread.start()
+                session_id = self.session_ids.setdefault(chat_id, self._next_session_id(chat_id))
+            # Update trạng thái script mỗi 5 phút do thread progress-monitor đảm nhiệm
+            # (độc lập lượt agent) — không còn vòng lặp trong lượt.
             self._ensure_harness()
-            try:
+            with self.run_lock:
+                result = self.harness.run(text, session_id=session_id)
+            if _is_collision_error(result):
+                # Runtime đã khởi động lại (ví dụ sau /cancel): session id cũ đã có
+                # log trên đĩa mà runtime mới không nhận. Tạo harness + session mới
+                # rồi chạy lại một lần.
+                logging.warning("Session id collision (chat %s); tạo session mới và chạy lại", chat_id)
+                self._harness_dead = True
+                self._make_harness()
+                with self.state_lock:
+                    session_id = self.session_ids.setdefault(chat_id, self._next_session_id(chat_id))
                 with self.run_lock:
                     result = self.harness.run(text, session_id=session_id)
-            finally:
-                stop_progress.set()
             answer = (result.final_response or "").strip()
             if not answer:
                 detail = "finish_reason=%s" % (result.finish_reason or "unknown")
@@ -616,6 +922,7 @@ def main() -> int:
             env_int("DSH_REQUEST_TIMEOUT_SEC", 7200),
         )
         logging.info("DeepSeek Harness agent enabled with model %s", os.environ.get("DSH_MODEL", "deepseek-v4-flash"))
+        _start_progress_monitor(ai_agent)
     else:
         if not deepseek_key:
             logging.warning("DEEPSEEK_API_KEY is missing; chat sẽ không dùng DeepSeek Harness")
