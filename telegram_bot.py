@@ -527,6 +527,18 @@ def status_message(ai_agent: Optional["DeepSeekAgent"], chat_id: int) -> str:
         lines.append("Script: " + (_progress_message() or "%s đang chạy." % PROJECTS[running]["label"]))
     else:
         lines.append("Script: không có script nào đang chạy.")
+    with _fastpath_state_lock:
+        fp_running = _fastpath_running
+        try:
+            fp_queued = [item[2]["pipeline"] for item in FASTPATH_QUEUE.queue]
+        except Exception:
+            fp_queued = []
+    if fp_running:
+        lines.append("Fast-path: đang chạy %s." % fp_running.upper())
+    if fp_queued:
+        lines.append("Fast-path queue: %s (%d job)." % (" → ".join(p.upper() for p in fp_queued), len(fp_queued)))
+    else:
+        lines.append("Fast-path queue: trống.")
     for key, project in PROJECTS.items():
         done_path = _project_dir(project) / project["done"]
         if done_path.is_file():
@@ -754,24 +766,24 @@ class DeepSeekAgent:
 
 
 FASTPATH_QUEUE: "queue.Queue[Tuple[TelegramAPI, int, Dict[str, Any]]]" = queue.Queue()
-_fastpath_active = 0  # số job fast-path đang chạy (0 hoặc 1)
+_fastpath_running: Optional[str] = None  # pipeline fast-path đang chạy (None = rảnh)
 _fastpath_state_lock = threading.Lock()
 
 
 def _fastpath_worker() -> None:
     """Worker chạy tuần tự từng job fast-path trong hàng đợi (mỗi lần 1 job)."""
-    global _fastpath_active
+    global _fastpath_running
     while True:
         api, chat_id, job = FASTPATH_QUEUE.get()
         with _fastpath_state_lock:
-            _fastpath_active = 1
+            _fastpath_running = job["pipeline"]
         try:
             _run_fastpath(api, chat_id, job)
         except Exception:
             logging.exception("Fast-path worker lỗi")
         finally:
             with _fastpath_state_lock:
-                _fastpath_active = 0
+                _fastpath_running = None
             FASTPATH_QUEUE.task_done()
 
 
@@ -905,7 +917,7 @@ def handle_update(
                 pass
             FASTPATH_QUEUE.put((api, chat_id, job))
             with _fastpath_state_lock:
-                pos = FASTPATH_QUEUE.qsize() + _fastpath_active
+                pos = FASTPATH_QUEUE.qsize() + (1 if _fastpath_running else 0)
             if pos <= 1:
                 api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
             else:
