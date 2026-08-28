@@ -5,15 +5,35 @@ Mục đích: tiết kiệm token DeepSeek. Những lệnh chạy pipeline lặp
 "chạy tri script" + đầy đủ config) được parse bằng code thường rồi chạy thẳng
 qua wrapper — không gọi `harness.run()`, tốn 0 token AI.
 
-Cũng đóng vai trò "1 script gộp" (giải pháp #2): agent có thể gọi
-`./run-pipeline.sh "<toàn bộ lệnh>"` bằng ĐÚNG 1 tool thay vì nhiều vòng.
+Hỗ trợ 3 pipeline: `tri`, `age`, `mockup`. Cú pháp:
 
-Tối ưu NAS: khi template/output nằm trên NAS (`[NAS]/...`), tải template về
-`local-run/tri/`, chạy local (nhanh hơn đọc WebDAV ~5–10×), rồi upload PNG kết
-quả lên NAS bằng WebDAV PUT (`curl -T`).
+  chạy tri
+  template: [NAS]/...          (hoặc templateFolder:)
+  output: [NAS]/...            (hoặc outputFolder:)
+  formula: [[name]][name]-xxx-[stt]
+  pháp csv | đức sheets | source: <url/csv>
+  limit: 2
 
-Hiện chỉ hỗ trợ `tri`. Lệnh `age`/`mockup` trả None để fallback về LLM (an toàn
-hơn là chạy sai), có thể mở rộng sau.
+  chạy age-script với
+  templateFolder: [NAS]/...
+  fromYear: 1990
+  toYear: 1990
+  months: 1
+  outputFormula: SMOKETEST-[mm]-[year]
+  outputFolder: [NAS]/...
+
+  chạy mockup-script
+  templateFolder: [NAS]/...
+  designFolder: [NAS]/...
+  outputFolder: [NAS]/...
+  limit: 0
+
+Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh "<toàn bộ lệnh>"`
+bằng ĐÚNG 1 tool thay vì nhiều vòng.
+
+Tối ưu NAS: khi template/design/output nằm trên NAS (`[NAS]/...`), tải về
+`local-run/<pipeline>/`, chạy local (nhanh hơn đọc WebDAV ~5–10×), rồi upload
+kết quả lên NAS bằng WebDAV PUT (`curl -T`).
 """
 
 from __future__ import annotations
@@ -28,7 +48,6 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
-LOCAL_RUN_DIR = ROOT / "local-run" / "tri"
 
 # Giữ đồng bộ với DATA_SOURCES trong tri-script/tri-script.jsx.
 DATA_SOURCES = {
@@ -45,8 +64,35 @@ DATA_SOURCES = {
 }
 
 PIPELINE_DIRS = {"tri": "tri-script", "age": "age-script", "mockup": "mockup-script"}
+DONE_FILES = {"tri": "tri-run.done", "age": "age-run.done", "mockup": "mockup-run.done"}
+CONFIG_FILES = {
+    "tri": ".fastpath-tri-config.json",
+    "age": ".fastpath-age-config.json",
+    "mockup": ".fastpath-mockup-config.json",
+}
+# field -> (thư mục con trong local-run, loại). "output" là thư mục kết quả.
+PIPELINE_FOLDERS = {
+    "tri": {
+        "templateFolder": ("PTS", "template"),
+        "outputFolder": ("Result", "output"),
+    },
+    "age": {
+        "templateFolder": ("PTS", "template"),
+        "outputFolder": ("Result", "output"),
+    },
+    "mockup": {
+        "templateFolder": ("PTS", "template"),
+        "designFolder": ("Design", "design"),
+        "outputFolder": ("Result", "output"),
+    },
+}
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
+DESIGN_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".gif", ".ai", ".eps"}
 IS_WINDOWS = os.name == "nt"
+
+
+def _local_run_dir(pipeline: str) -> Path:
+    return ROOT / "local-run" / pipeline
 
 
 def _curl_bin() -> str:
@@ -78,7 +124,7 @@ def _normalize_nas(value: str) -> str:
 def _field(text: str, keyword: str) -> Optional[str]:
     """Lấy giá trị sau keyword ở đầu dòng (chấp nhận 'keyword folder: value'...)."""
     m = re.search(
-        r"(?m)^\s*" + re.escape(keyword) + r"\b\s*(?:folder\s*)?[:\-]?\s*(.+?)\s*$",
+        r"(?m)^\s*[-*•]?\s*" + re.escape(keyword) + r"\b\s*(?:folder\s*)?[:\-]?\s*(.+?)\s*$",
         text,
     )
     if not m:
@@ -86,8 +132,45 @@ def _field(text: str, keyword: str) -> Optional[str]:
     return m.group(1).strip()
 
 
+def _field_ci(text: str, keyword: str) -> Optional[str]:
+    """Như _field nhưng không phân biệt hoa thường (cho camelCase: templateFolder...)."""
+    m = re.search(
+        r"(?m)^\s*[-*•]?\s*" + re.escape(keyword) + r"\b\s*[:\-]?\s*(.+?)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _field_any(text: str, *keywords: str) -> Optional[str]:
+    for kw in keywords:
+        v = _field_ci(text, kw)
+        if v:
+            return v
+    return None
+
+
+def _int_field_ci(text: str, keyword: str) -> Optional[int]:
+    m = re.search(
+        r"(?m)^\s*[-*•]?\s*" + re.escape(keyword) + r"\b\s*[:\-]?\s*(\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    return int(m.group(1)) if m else None
+
+
+def _int_field_any(text: str, *keywords: str) -> Optional[int]:
+    for kw in keywords:
+        v = _int_field_ci(text, kw)
+        if v is not None:
+            return v
+    return None
+
+
 def _limit(text: str) -> int:
-    m = re.search(r"(?m)^\s*limit\b\s*[:\-]?\s*(\d+)", text, re.IGNORECASE)
+    m = re.search(r"(?m)^\s*[-*•]?\s*limit\b\s*[:\-]?\s*(\d+)", text, re.IGNORECASE)
     return int(m.group(1)) if m else 0
 
 
@@ -104,6 +187,22 @@ def _source_type(text: str) -> str:
     return "sheets" if re.search(r"\bsheets?\b", text, re.IGNORECASE) else "csv"
 
 
+def _months_field(text: str) -> Optional[List[int]]:
+    """Parse 'months'. Trả None = tất cả tháng; ngược lại trả list số tháng 1..12."""
+    v = _field_ci(text, "months")
+    if v is None:
+        return None
+    v = v.strip().lower()
+    if v in ("", "tất cả", "tat ca", "all", "hết", "het", "tự dò", "auto"):
+        return None
+    nums = sorted(set(int(x) for x in re.findall(r"\d+", v) if 1 <= int(x) <= 12))
+    return nums if nums else None
+
+
+# ---------------------------------------------------------------------------
+# parse_job — nhận diện lệnh chạy có cấu trúc cho từng pipeline
+# ---------------------------------------------------------------------------
+
 def parse_job(text: str) -> Optional[Dict]:
     """Nhận diện lệnh chạy có cấu trúc. Trả None nếu không đủ/không khớp (fallback LLM)."""
     t = text.strip()
@@ -114,9 +213,14 @@ def parse_job(text: str) -> Optional[Dict]:
     if not m:
         return None
     pipeline = m.group(1)
-    if pipeline != "tri":
-        return None  # age/mockup chưa hỗ trợ fast-path
+    if pipeline == "tri":
+        return _parse_tri(t, low)
+    if pipeline == "age":
+        return _parse_age(t, low)
+    return _parse_mockup(t, low)
 
+
+def _parse_tri(t: str, low: str) -> Optional[Dict]:
     template = _field(t, "template")
     output = _field(t, "output")
     formula = _field(t, "formula")
@@ -152,10 +256,61 @@ def parse_job(text: str) -> Optional[Dict]:
     return job
 
 
+def _parse_age(t: str, low: str) -> Optional[Dict]:
+    template = _field_any(t, "templateFolder", "template")
+    output = _field_any(t, "outputFolder", "output")
+    formula = _field_any(t, "outputFormula", "formula")
+    from_year = _int_field_any(t, "fromYear", "from_year")
+    to_year = _int_field_any(t, "toYear", "to_year")
+    if not template or not output or from_year is None or to_year is None:
+        return None
+    if to_year < from_year:
+        return None
+
+    months = _months_field(t)
+    job = {
+        "pipeline": "age",
+        "templateFolder": _normalize_nas(template),
+        "outputFolder": _normalize_nas(output),
+        "outputFormula": formula or "[mm]-[year]",
+        "fromYear": from_year,
+        "toYear": to_year,
+        "months": months,
+        "install_fonts": bool(re.search(r"\bfonts?\b", low)),
+        "smoke": bool(re.search(r"\b(smoke|test)\b", low)),
+    }
+    if job["smoke"]:
+        job["toYear"] = job["fromYear"]
+        job["months"] = [job["months"][0]] if job["months"] else [1]
+    return job
+
+
+def _parse_mockup(t: str, low: str) -> Optional[Dict]:
+    template = _field_any(t, "templateFolder", "template")
+    design = _field_any(t, "designFolder", "design")
+    output = _field_any(t, "outputFolder", "output")
+    if not template or not design or not output:
+        return None
+
+    limit = _limit(t)
+    job = {
+        "pipeline": "mockup",
+        "templateFolder": _normalize_nas(template),
+        "designFolder": _normalize_nas(design),
+        "outputFolder": _normalize_nas(output),
+        "limit": limit,
+        "install_fonts": bool(re.search(r"\bfonts?\b", low)),
+        "smoke": bool(re.search(r"\b(smoke|test)\b", low)),
+    }
+    if job["smoke"]:
+        job["limit"] = 1
+    return job
+
+
 # --- NAS helpers -------------------------------------------------------------
 
 def _load_nas_env(script_dir: Path) -> Dict[str, str]:
-    """Đọc tri-script/.env (WEBDAV_USERNAME/PASSWORD + NAS_URL_1..N)."""
+    """Đọc <pipeline>/.env (WEBDAV_USERNAME/PASSWORD + NAS_URL_1..N)."""
     env: Dict[str, str] = {}
     env_file = script_dir / ".env"
     if env_file.is_file():
@@ -204,7 +359,7 @@ def _pick_webdav_url(env: Dict[str, str]) -> Optional[str]:
     user = env.get("WEBDAV_USERNAME", "")
     pwd = env.get("WEBDAV_PASSWORD", "")
     if not user:
-        raise FastPathError("Thiếu WEBDAV_USERNAME trong tri-script/.env.")
+        raise FastPathError("Thiếu WEBDAV_USERNAME trong <pipeline>/.env.")
     for i in range(1, 6):
         url = env.get("NAS_URL_%d" % i, "")
         if url and _probe_webdav(url, user, pwd):
@@ -240,6 +395,20 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
     return copied
 
 
+def _copy_design(src: Path, dst: Path) -> List[str]:
+    """Copy ảnh design (jpg/png/tif/psd/gif/ai/eps) từ NAS về local."""
+    if not src.is_dir():
+        raise FastPathError("Design folder trên NAS không tồn tại: %s" % src)
+    copied: List[str] = []
+    for f in sorted(src.iterdir()):
+        if f.is_file() and f.suffix.lower() in DESIGN_EXTS:
+            shutil.copy2(str(f), str(dst / f.name))
+            copied.append(f.name)
+    if not copied:
+        raise FastPathError("Không thấy file design nào trong: %s" % src)
+    return copied
+
+
 def _ensure_webdav_dir(base_url: str, rel: str, user: str, pwd: str) -> None:
     """Tạo từng cấp thư mục trên NAS (MKCOL) — bỏ qua lỗi 'đã tồn tại'."""
     cur = base_url.rstrip("/")
@@ -251,11 +420,17 @@ def _ensure_webdav_dir(base_url: str, rel: str, user: str, pwd: str) -> None:
         )
 
 
-def _upload_pngs(local_dir: Path, base_url: str, rel: str, user: str, pwd: str) -> int:
-    """Upload từng PNG bằng WebDAV PUT (curl -T). Trả số file đã upload."""
+def _output_exts(pipeline: str) -> Tuple[str, ...]:
+    """Đuôi file kết quả theo pipeline: mockup xuất .jpg, tri/age xuất .png."""
+    return (".jpg", ".jpeg") if pipeline == "mockup" else (".png",)
+
+
+def _upload_outputs(local_dir: Path, base_url: str, rel: str, user: str, pwd: str, pipeline: str) -> int:
+    """Upload từng file kết quả bằng WebDAV PUT (curl -T). Trả số file đã upload."""
+    exts = _output_exts(pipeline)
     count = 0
     for f in sorted(local_dir.iterdir()):
-        if f.suffix.lower() != ".png":
+        if f.suffix.lower() not in exts:
             continue
         url = "%s/%s/%s" % (base_url.rstrip("/"), rel.strip("/"), f.name)
         proc = subprocess.run(
@@ -297,7 +472,7 @@ def _font_dir() -> Path:
 
 
 def scan_rules(folder: Path) -> List[Dict]:
-    """Quét .psd trong thư mục template, lấy số ở đuôi tên file làm độ dài tên."""
+    """Quét .psd trong thư mục template, lấy số ở đuôi tên file làm độ dài tên (tri)."""
     if not folder.is_dir():
         raise FastPathError("Template folder không tồn tại: %s" % folder)
     rules: List[Dict] = []
@@ -314,6 +489,36 @@ def scan_rules(folder: Path) -> List[Dict]:
             "Không tìm thấy file .psd đánh số (vd 2.psd..11.psd) trong template — để agent xử lý."
         )
     return rules
+
+
+def _build_months_map(template_dir: Path, requested_months: Optional[List[int]]) -> Dict[str, str]:
+    """Ánh xạ tháng → file .psd (số cuối tên file = tháng), giống age-script.jsx."""
+    if not template_dir.is_dir():
+        raise FastPathError("Template folder không tồn tại: %s" % template_dir)
+    month_map: Dict[str, str] = {}
+    for f in sorted(template_dir.iterdir()):
+        if f.suffix.lower() != ".psd":
+            continue
+        m = re.search(r"(\d+)\s*$", f.stem)
+        if not m:
+            continue
+        month = int(m.group(1))
+        if 1 <= month <= 12 and str(month) not in month_map:
+            month_map[str(month)] = f.name
+    if not month_map:
+        raise FastPathError(
+            "Không tìm thấy file .psd đánh số tháng (vd 1.psd..12.psd) trong template — để agent xử lý."
+        )
+    if requested_months is None:
+        return month_map
+    result = {}
+    for month in requested_months:
+        key = str(month)
+        if key in month_map:
+            result[key] = month_map[key]
+    if not result:
+        raise FastPathError("Không thấy template cho tháng đã chọn: %s" % requested_months)
+    return result
 
 
 def install_fonts(folder: Path) -> List[str]:
@@ -338,124 +543,170 @@ def install_fonts(folder: Path) -> List[str]:
     return installed
 
 
-def _count_png(folder: Path) -> int:
+def _count_output(folder: Path, pipeline: str) -> int:
+    exts = _output_exts(pipeline)
     try:
-        return sum(1 for f in folder.iterdir() if f.suffix.lower() == ".png")
+        return sum(1 for f in folder.iterdir() if f.suffix.lower() in exts)
     except OSError:
         return 0
 
 
-def _run_wrapper(script_dir: Path, config_path: Path, timeout: int) -> subprocess.CompletedProcess:
-    """Chạy wrapper đúng theo OS: run-tri.bat (Windows) hoặc run-tri.sh (macOS)."""
+def _build_config(job: Dict, resolved: Dict[str, str], script_dir: Path) -> Dict:
+    """Sinh config JSON cho từng pipeline từ đường dẫn đã resolve."""
+    pipeline = job["pipeline"]
+    if pipeline == "tri":
+        return {
+            "source": job["source"],
+            "sourceLabel": job["sourceLabel"],
+            "templateFolder": resolved["templateFolder"],
+            "outputFolder": resolved["outputFolder"],
+            "outputFormula": job["outputFormula"],
+            "limit": job["limit"],
+            "rules": scan_rules(Path(resolved["templateFolder"])),
+        }
+    if pipeline == "age":
+        return {
+            "fromYear": job["fromYear"],
+            "toYear": job["toYear"],
+            "templateFolder": resolved["templateFolder"],
+            "outputFolder": resolved["outputFolder"],
+            "outputFormula": job["outputFormula"],
+            "months": _build_months_map(Path(resolved["templateFolder"]), job.get("months")),
+        }
+    # mockup
+    return {
+        "templateFolder": resolved["templateFolder"],
+        "designFolder": resolved["designFolder"],
+        "outputFolder": resolved["outputFolder"],
+        "limit": job.get("limit", 0),
+    }
+
+
+def _config_summary(job: Dict, cfg: Dict) -> str:
+    pipeline = job["pipeline"]
+    if pipeline == "tri":
+        return "✅ Config: %s | %d rule template | limit=%s | source=%s" % (
+            cfg["sourceLabel"], len(cfg["rules"]), cfg["limit"], cfg["source"],
+        )
+    if pipeline == "age":
+        return "✅ Config: %d→%d | %d tháng | công thức: %s" % (
+            cfg["fromYear"], cfg["toYear"], len(cfg["months"]), cfg["outputFormula"],
+        )
+    return "✅ Config: limit=%s | template=%s | design=%s" % (
+        cfg["limit"], cfg["templateFolder"], cfg["designFolder"],
+    )
+
+
+def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: int) -> subprocess.CompletedProcess:
+    """Chạy wrapper đúng theo OS: run-<pipeline>.bat (Windows) hoặc run-<pipeline>.sh (macOS)."""
     if IS_WINDOWS:
-        cmd = ["cmd", "/c", "run-tri.bat", str(config_path)]
+        cmd = ["cmd", "/c", "run-%s.bat" % pipeline, str(config_path)]
     else:
-        cmd = ["./run-tri.sh", str(config_path)]
+        cmd = ["./run-%s.sh" % pipeline, str(config_path)]
     return subprocess.run(
         cmd, cwd=str(script_dir), capture_output=True, text=True, errors="replace", timeout=timeout
     )
 
 
 def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """Chạy job tri và trả về báo cáo ngắn gọn. Không gọi LLM."""
+    """Chạy job pipeline (tri/age/mockup) và trả về báo cáo ngắn gọn. Không gọi LLM."""
     if IS_WINDOWS:
         return _run_windows(job, log)
     return _run_macos(job, log)
 
 
 def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """macOS: chạy local khi dùng NAS (tải template về → chạy → upload kết quả)."""
+    """macOS: chạy local khi dùng NAS (tải template/design về → chạy → upload kết quả)."""
     def emit(msg: str) -> None:
         if log:
             log(msg)
 
-    script_dir = ROOT / "tri-script"
-    template_in = job["templateFolder"]
-    output_in = job["outputFolder"]
-    needs_nas = template_in.startswith("[NAS]") or output_in.startswith("[NAS]")
+    pipeline = job["pipeline"]
+    script_dir = ROOT / PIPELINE_DIRS[pipeline]
+    done_file = script_dir / DONE_FILES[pipeline]
+    config_path = script_dir / CONFIG_FILES[pipeline]
+    local_root = _local_run_dir(pipeline)
+    folders = PIPELINE_FOLDERS[pipeline]
 
+    needs_nas = any(job.get(f, "").startswith("[NAS]") for f in folders)
     emit("📋 Fast-path: phân tích lệnh (không qua AI)...")
 
-    upload_target: Optional[Tuple[str, str, str, str]] = None  # (base_url, user, pwd, rel)
-    report_output: str = ""
+    upload_target: Optional[Tuple[str, str, str, str]] = None
+    report_output = ""
 
     try:
+        resolved: Dict[str, str] = {}
         if needs_nas:
-            emit("🗂 NAS: mount + chuẩn bị chạy local (tải template về, upload kết quả lên)...")
+            emit("🗂 NAS: mount + chuẩn bị chạy local (tải về, upload kết quả lên)...")
             mount_point = _mount_point(script_dir)
             nas_env = _load_nas_env(script_dir)
             user = nas_env.get("WEBDAV_USERNAME", "")
             pwd = nas_env.get("WEBDAV_PASSWORD", "")
 
-            if LOCAL_RUN_DIR.exists():
-                shutil.rmtree(LOCAL_RUN_DIR, ignore_errors=True)
-            LOCAL_RUN_DIR.mkdir(parents=True)
+            if local_root.exists():
+                shutil.rmtree(local_root, ignore_errors=True)
+            local_root.mkdir(parents=True)
 
-            if template_in.startswith("[NAS]"):
-                nas_template = _resolve_path(template_in, script_dir, mount_point)
-                local_template = LOCAL_RUN_DIR / "PTS"
-                local_template.mkdir(parents=True)
-                copied = _copy_nas_template(Path(nas_template), local_template)
-                emit("✅ Tải template về local: %d file." % len(copied))
-                template = str(local_template)
-            else:
-                template = _resolve_path(template_in, script_dir, None)
-
-            if output_in.startswith("[NAS]"):
-                local_output = LOCAL_RUN_DIR / "Result"
-                local_output.mkdir(parents=True)
-                output = str(local_output)
-                rel = output_in[len("[NAS]"):].lstrip("/")
-                base_url = _pick_webdav_url(nas_env)
-                if not base_url:
-                    raise FastPathError("Không tìm được tuyến WebDAV để upload kết quả.")
-                upload_target = (base_url, user, pwd, rel)
-                report_output = output_in
-            else:
-                output = _resolve_path(output_in, script_dir, None)
-                report_output = output
+            for field, (subdir, kind) in folders.items():
+                value = job.get(field)
+                if not value:
+                    continue
+                if value.startswith("[NAS]"):
+                    nas_path = _resolve_path(value, script_dir, mount_point)
+                    if kind == "output":
+                        local_out = local_root / subdir
+                        local_out.mkdir(parents=True)
+                        resolved[field] = str(local_out)
+                        rel = value[len("[NAS]"):].lstrip("/")
+                        base_url = _pick_webdav_url(nas_env)
+                        if not base_url:
+                            raise FastPathError("Không tìm được tuyến WebDAV để upload kết quả.")
+                        upload_target = (base_url, user, pwd, rel)
+                        report_output = value
+                    else:
+                        local_sub = local_root / subdir
+                        local_sub.mkdir(parents=True)
+                        if kind == "template":
+                            _copy_nas_template(Path(nas_path), local_sub)
+                        elif kind == "design":
+                            _copy_design(Path(nas_path), local_sub)
+                        resolved[field] = str(local_sub)
+                else:
+                    resolved[field] = _resolve_path(value, script_dir, None)
+                    if kind == "output":
+                        report_output = resolved[field]
         else:
-            template = _resolve_path(template_in, script_dir, None)
-            output = _resolve_path(output_in, script_dir, None)
-            report_output = output
+            for field, (subdir, kind) in folders.items():
+                value = job.get(field)
+                if not value:
+                    continue
+                resolved[field] = _resolve_path(value, script_dir, None)
+                if kind == "output":
+                    report_output = resolved[field]
 
-        rules = scan_rules(Path(template))
-        cfg = {
-            "source": job["source"],
-            "sourceLabel": job["sourceLabel"],
-            "templateFolder": template,
-            "outputFolder": output,
-            "outputFormula": job["outputFormula"],
-            "limit": job["limit"],
-            "rules": rules,
-        }
-        config_path = script_dir / ".fastpath-tri-config.json"
+        cfg = _build_config(job, resolved, script_dir)
         config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        emit(
-            "✅ Config: %s | %d rule template | limit=%s | source=%s"
-            % (cfg["sourceLabel"], len(rules), cfg["limit"], cfg["source"])
-        )
+        emit(_config_summary(job, cfg))
 
         if job.get("install_fonts"):
-            fonts = install_fonts(Path(template))
+            fonts = install_fonts(Path(resolved.get("templateFolder", "")))
             if fonts:
                 emit("🔤 Đã cài font: " + ", ".join(fonts))
 
-        emit("🚀 Chạy run-tri.sh (có thể mất nhiều phút)...")
+        emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
         try:
-            proc = _run_wrapper(script_dir, config_path, timeout)
+            proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
         except subprocess.TimeoutExpired:
-            return "❌ Timeout — tri (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % timeout
+            return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
 
-        done_path = script_dir / "tri-run.done"
         status = ""
-        if done_path.is_file():
+        if done_file.is_file():
             try:
-                status = done_path.read_text(encoding="utf-8").strip()
+                status = done_file.read_text(encoding="utf-8").strip()
             except OSError:
                 status = "?"
-        count = _count_png(Path(output))
+        count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
         tail = (proc.stdout or "").strip()[-1200:]
 
         success = proc.returncode == 0 and status == "OK"
@@ -464,91 +715,85 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
             emit("⬆️ Upload kết quả lên NAS...")
             base_url, user, pwd, rel = upload_target
             _ensure_webdav_dir(base_url, rel, user, pwd)
-            uploaded = _upload_pngs(Path(output), base_url, rel, user, pwd)
+            uploaded = _upload_outputs(Path(resolved["outputFolder"]), base_url, rel, user, pwd, pipeline)
             emit("✅ Đã upload %d ảnh lên NAS." % uploaded)
 
         lines = []
         if success:
-            lines.append("✅ Xong — tri: %d ảnh, exit OK." % count)
+            lines.append("✅ Xong — %s: %d ảnh, exit OK." % (pipeline, count))
         elif proc.returncode == 130:
-            lines.append("⛔ Đã huỷ — tri.")
+            lines.append("⛔ Đã huỷ — %s." % pipeline)
         else:
-            lines.append("❌ Lỗi — tri (exit %s, done=%s)." % (proc.returncode, status or "MISSING"))
+            lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, proc.returncode, status or "MISSING"))
         lines.append("Output: %s" % report_output)
         if not success and proc.returncode not in (0, 130) and tail:
             lines.append("Log (cuối):\n" + tail)
         return "\n".join(lines)
     finally:
         if needs_nas:
-            shutil.rmtree(LOCAL_RUN_DIR, ignore_errors=True)
+            shutil.rmtree(local_root, ignore_errors=True)
 
 
 def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """Windows: chạy trực tiếp qua run-tri.bat (SMB native nhanh, không cần local-run)."""
+    """Windows: chạy trực tiếp qua run-<pipeline>.bat (SMB native nhanh, không cần local-run)."""
     def emit(msg: str) -> None:
         if log:
             log(msg)
 
-    script_dir = ROOT / "tri-script"
-    template_in = job["templateFolder"]
-    output_in = job["outputFolder"]
-    needs_nas = template_in.startswith("[NAS]") or output_in.startswith("[NAS]")
+    pipeline = job["pipeline"]
+    script_dir = ROOT / PIPELINE_DIRS[pipeline]
+    done_file = script_dir / DONE_FILES[pipeline]
+    config_path = script_dir / CONFIG_FILES[pipeline]
+    folders = PIPELINE_FOLDERS[pipeline]
 
+    needs_nas = any(job.get(f, "").startswith("[NAS]") for f in folders)
     emit("📋 Fast-path: phân tích lệnh (không qua AI)...")
     mount_point = None
     if needs_nas:
         emit("🗂 NAS: kết nối (SMB/UNC hoặc WebDAV)...")
         mount_point = _mount_point(script_dir)
 
-    template = _resolve_path(template_in, script_dir, mount_point)
-    output = _resolve_path(output_in, script_dir, mount_point)
+    resolved: Dict[str, str] = {}
+    report_output = ""
+    for field, (subdir, kind) in folders.items():
+        value = job.get(field)
+        if not value:
+            continue
+        resolved[field] = _resolve_path(value, script_dir, mount_point)
+        if kind == "output":
+            report_output = value if value.startswith("[NAS]") else resolved[field]
 
-    rules = scan_rules(Path(template))
-    cfg = {
-        "source": job["source"],
-        "sourceLabel": job["sourceLabel"],
-        "templateFolder": template,
-        "outputFolder": output,
-        "outputFormula": job["outputFormula"],
-        "limit": job["limit"],
-        "rules": rules,
-    }
-    config_path = script_dir / ".fastpath-tri-config.json"
+    cfg = _build_config(job, resolved, script_dir)
     config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    emit(
-        "✅ Config: %s | %d rule template | limit=%s | source=%s"
-        % (cfg["sourceLabel"], len(rules), cfg["limit"], cfg["source"])
-    )
+    emit(_config_summary(job, cfg))
 
     if job.get("install_fonts"):
-        fonts = install_fonts(Path(template))
+        fonts = install_fonts(Path(resolved.get("templateFolder", "")))
         if fonts:
             emit("🔤 Đã cài font: " + ", ".join(fonts))
 
-    emit("🚀 Chạy run-tri.bat (có thể mất nhiều phút)...")
+    emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
     timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
     try:
-        proc = _run_wrapper(script_dir, config_path, timeout)
+        proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
     except subprocess.TimeoutExpired:
-        return "❌ Timeout — tri (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % timeout
+        return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
 
-    done_path = script_dir / "tri-run.done"
     status = ""
-    if done_path.is_file():
+    if done_file.is_file():
         try:
-            status = done_path.read_text(encoding="utf-8").strip()
+            status = done_file.read_text(encoding="utf-8").strip()
         except OSError:
             status = "?"
-    count = _count_png(Path(output))
+    count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
     tail = (proc.stdout or "").strip()[-1200:]
 
     success = proc.returncode == 0 and status == "OK"
-    report_output = output_in if output_in.startswith("[NAS]") else output
     lines = []
     if success:
-        lines.append("✅ Xong — tri: %d ảnh, exit OK." % count)
+        lines.append("✅ Xong — %s: %d ảnh, exit OK." % (pipeline, count))
     else:
-        lines.append("❌ Lỗi — tri (exit %s, done=%s)." % (proc.returncode, status or "MISSING"))
+        lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, proc.returncode, status or "MISSING"))
     lines.append("Output: %s" % report_output)
     if not success and tail:
         lines.append("Log (cuối):\n" + tail)
@@ -561,7 +806,7 @@ def main(argv: List[str]) -> int:
     if job is None:
         print(
             "Không nhận diện được lệnh chạy.\n"
-            "Fast-path chỉ nhận lệnh 'chạy tri ...' với đủ template/output/formula/nguồn.",
+            "Fast-path nhận lệnh 'chạy tri/age/mockup ...' với đủ config (template/nguồn/output/limit...).",
             file=sys.stderr,
         )
         return 2
