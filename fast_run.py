@@ -415,7 +415,7 @@ def _ensure_webdav_dir(base_url: str, rel: str, user: str, pwd: str) -> None:
     for part in rel.strip("/").split("/"):
         cur += "/" + part
         subprocess.run(
-            [_curl_bin(), "-sS", "-X", "MKCOL", "-u", "%s:%s" % (user, pwd), cur],
+            [_curl_bin(), "-sS", "-g", "-X", "MKCOL", "-u", "%s:%s" % (user, pwd), cur],
             capture_output=True, text=True, timeout=60,
         )
 
@@ -432,9 +432,11 @@ def _upload_outputs(local_dir: Path, base_url: str, rel: str, user: str, pwd: st
     for f in sorted(local_dir.iterdir()):
         if f.suffix.lower() not in exts:
             continue
+        # -g/--globoff: tắt glob URL — tên file có ký tự [ ] (vd "[[name]2]..." trong
+        # tri) nếu không sẽ bị curl hiểu nhầm thành range và báo "bad range".
         url = "%s/%s/%s" % (base_url.rstrip("/"), rel.strip("/"), f.name)
         proc = subprocess.run(
-            [_curl_bin(), "-sS", "--fail", "-T", str(f), "-u", "%s:%s" % (user, pwd), url],
+            [_curl_bin(), "-sS", "-g", "--fail", "-T", str(f), "-u", "%s:%s" % (user, pwd), url],
             capture_output=True, text=True, timeout=120,
         )
         if proc.returncode != 0:
