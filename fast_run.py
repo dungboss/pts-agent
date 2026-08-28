@@ -47,7 +47,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -706,22 +705,13 @@ def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: in
     return _run_capture(cmd, script_dir, timeout)
 
 
-def _restart_photoshop() -> None:
-    """Quit rồi mở lại Photoshop sau mỗi lần chạy (tránh kẹt / đầy RAM)."""
+def _close_photoshop() -> None:
+    """Tắt Photoshop sau mỗi lần chạy (không mở lại — wrapper run-*.bat/.sh
+    sẽ tự mở Photoshop khi chạy job kế tiếp)."""
     if IS_WINDOWS:
         try:
             subprocess.run(
                 ["taskkill", "/IM", "Photoshop.exe", "/F"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            pass
-        time.sleep(4)
-        try:
-            # KHÔNG capture output: `start` cho Photoshop thừa kế pipe stdout/stderr
-            # → subprocess.run đợi pipe đóng = đợi tới khi Photoshop thoát (treo).
-            subprocess.run(
-                ["cmd", "/c", "start", "", "Photoshop.exe"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
             )
         except subprocess.TimeoutExpired:
@@ -740,13 +730,6 @@ def _restart_photoshop() -> None:
         subprocess.run(
             ["osascript", "-e", 'tell application "%s" to quit' % ps_app],
             capture_output=True, text=True, timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        pass
-    time.sleep(4)
-    try:
-        subprocess.run(
-            ["open", "-a", ps_app], capture_output=True, text=True, timeout=60,
         )
     except subprocess.TimeoutExpired:
         pass
@@ -883,9 +866,9 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
         if not success and proc.returncode not in (0, 130) and tail:
             lines.append("Log (cuối):\n" + tail)
 
-        # Restart Photoshop sau mỗi lần chạy (trừ khi bị huỷ) để tránh kẹt / đầy RAM
+        # Tắt Photoshop sau mỗi lần chạy (trừ khi bị huỷ) — job kế tự mở lại khi cần
         if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
-            _restart_photoshop()
+            _close_photoshop()
 
         return "\n".join(lines)
     finally:
@@ -964,9 +947,9 @@ def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     if not success and tail:
         lines.append("Log (cuối):\n" + tail)
 
-    # Restart Photoshop sau mỗi lần chạy (trừ khi bị huỷ)
+    # Tắt Photoshop sau mỗi lần chạy (trừ khi bị huỷ) — job kế tự mở lại khi cần
     if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
-        _restart_photoshop()
+        _close_photoshop()
 
     return "\n".join(lines)
 
