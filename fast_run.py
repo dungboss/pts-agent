@@ -690,6 +690,17 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
         config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         emit(_config_summary(job, cfg))
 
+        # Tạo thư mục output trước khi chạy nếu chưa tồn tại (local + NAS)
+        out_dir = Path(resolved.get("outputFolder", ""))
+        if out_dir:
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        if upload_target:
+            base_url, user, pwd, rel = upload_target
+            _ensure_webdav_dir(base_url, rel, user, pwd)
+
         if job.get("install_fonts"):
             fonts = install_fonts(Path(resolved.get("templateFolder", "")))
             if fonts:
@@ -768,6 +779,14 @@ def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     cfg = _build_config(job, resolved, script_dir)
     config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     emit(_config_summary(job, cfg))
+
+    # Tạo thư mục output trước khi chạy nếu chưa tồn tại
+    out_dir = Path(resolved.get("outputFolder", ""))
+    if out_dir:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
     if job.get("install_fonts"):
         fonts = install_fonts(Path(resolved.get("templateFolder", "")))
