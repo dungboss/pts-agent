@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -752,14 +753,43 @@ class DeepSeekAgent:
                 self.telegram_api.send_message(chat_id, "DeepSeek Harness gặp lỗi: %s" % exc)
 
 
-FASTPATH_LOCK = threading.Lock()
+FASTPATH_QUEUE: "queue.Queue[Tuple[TelegramAPI, int, Dict[str, Any]]]" = queue.Queue()
+_fastpath_active = 0  # số job fast-path đang chạy (0 hoặc 1)
+_fastpath_state_lock = threading.Lock()
+
+
+def _fastpath_worker() -> None:
+    """Worker chạy tuần tự từng job fast-path trong hàng đợi (mỗi lần 1 job)."""
+    global _fastpath_active
+    while True:
+        api, chat_id, job = FASTPATH_QUEUE.get()
+        with _fastpath_state_lock:
+            _fastpath_active = 1
+        try:
+            _run_fastpath(api, chat_id, job)
+        except Exception:
+            logging.exception("Fast-path worker lỗi")
+        finally:
+            with _fastpath_state_lock:
+                _fastpath_active = 0
+            FASTPATH_QUEUE.task_done()
+
+
+def clear_fastpath_queue() -> int:
+    """Bỏ hết job fast-path đang chờ (không đụng job đang chạy). Trả số job đã bỏ."""
+    cleared = 0
+    while True:
+        try:
+            FASTPATH_QUEUE.get_nowait()
+            FASTPATH_QUEUE.task_done()
+            cleared += 1
+        except queue.Empty:
+            break
+    return cleared
 
 
 def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
-    """Chạy job pipeline theo fast-path (không qua LLM) trong thread nền."""
-    if not FASTPATH_LOCK.acquire(blocking=False):
-        api.send_message(chat_id, "⏳ Đang có job pipeline khác chạy — hãy chờ xong rồi gửi lại.")
-        return
+    """Chạy 1 job fast-path (được worker gọi tuần tự)."""
     stop_progress = threading.Event()
     interval = env_int("TELEGRAM_PROGRESS_INTERVAL_SEC", 300, 10)
     started = time.time()
@@ -792,7 +822,6 @@ def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
         api.send_message(chat_id, "⚠️ Fast-path không chạy được: %s\nBạn có thể gửi lại để agent xử lý." % exc)
     finally:
         stop_progress.set()
-        FASTPATH_LOCK.release()
 
 
 def save_offset(offset: int) -> None:
@@ -852,12 +881,15 @@ def handle_update(
         stopped = cancel_running_script()
         threading.Thread(target=_photoshop_watchdog, daemon=True).start()
         cleared = ai_agent.clear_queue(chat_id) if ai_agent is not None else 0
+        cleared_fp = clear_fastpath_queue()
         parts = []
         parts.append("Đã dừng: %s." % ", ".join(stopped) if stopped else "Không thấy script đang chạy.")
         if "Photoshop" in stopped:
             parts.append("Photoshop đã tắt — lần chạy sau sẽ tự mở lại khi cần.")
         if cleared:
             parts.append("Đã bỏ %d việc đang xếp hàng." % cleared)
+        if cleared_fp:
+            parts.append("Đã bỏ %d việc fast-path đang chờ." % cleared_fp)
         api.send_message(chat_id, " ".join(parts))
         return
     if fast_run is not None:
@@ -871,8 +903,13 @@ def handle_update(
                     CANCEL_FLAG.unlink()
             except OSError:
                 pass
-            api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
-            threading.Thread(target=_run_fastpath, args=(api, chat_id, job), daemon=True).start()
+            FASTPATH_QUEUE.put((api, chat_id, job))
+            with _fastpath_state_lock:
+                pos = FASTPATH_QUEUE.qsize() + _fastpath_active
+            if pos <= 1:
+                api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
+            else:
+                api.send_message(chat_id, "🚀 Fast-path: đã xếp hàng %s (không qua AI). Vị trí: %d." % (job["pipeline"].upper(), pos))
             return
     if ai_agent is None:
         api.send_message(chat_id, "Chưa cấu hình DEEPSEEK_API_KEY hoặc deepseek-harness-sdk nên agent chưa hoạt động.")
@@ -943,6 +980,9 @@ def main() -> int:
         offset = max((int(item["update_id"]) for item in pending), default=-1) + 1
         save_offset(offset)
         logging.info("Skipped %d old Telegram update(s)", len(pending))
+
+    # Worker chạy tuần tự các job fast-path (mỗi lần 1 job)
+    threading.Thread(target=_fastpath_worker, daemon=True).start()
 
     while True:
         try:
