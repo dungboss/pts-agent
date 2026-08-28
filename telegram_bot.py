@@ -863,6 +863,14 @@ def handle_update(
     if fast_run is not None:
         job = fast_run.parse_job(text)
         if job is not None:
+            # Lệnh chạy mới → xoá cờ huỷ cũ (giống submit bên dưới). Không xoá thì run-tri.sh
+            # sẽ thấy .cancel-flag còn sót và thoát ngay "Có lệnh huỷ trước đó" → exit 0,
+            # done MISSING dù không có lỗi thật.
+            try:
+                if CANCEL_FLAG.exists():
+                    CANCEL_FLAG.unlink()
+            except OSError:
+                pass
             api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
             threading.Thread(target=_run_fastpath, args=(api, chat_id, job), daemon=True).start()
             return
