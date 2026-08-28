@@ -249,7 +249,7 @@ def _parse_tri(t: str, low: str) -> Optional[Dict]:
         "outputFormula": formula,
         "limit": _limit(t),
         "install_fonts": bool(re.search(r"\bfonts?\b", low)),
-        "smoke": bool(re.search(r"\b(smoke|test)\b", low)),
+        "smoke": bool(re.search(r"\bsmoke\b", low)),
     }
     if job["smoke"]:
         job["limit"] = 1  # smoke test: chỉ chạy 1 ảnh đầu
@@ -277,7 +277,7 @@ def _parse_age(t: str, low: str) -> Optional[Dict]:
         "toYear": to_year,
         "months": months,
         "install_fonts": bool(re.search(r"\bfonts?\b", low)),
-        "smoke": bool(re.search(r"\b(smoke|test)\b", low)),
+        "smoke": bool(re.search(r"\bsmoke\b", low)),
     }
     if job["smoke"]:
         job["toYear"] = job["fromYear"]
@@ -300,7 +300,7 @@ def _parse_mockup(t: str, low: str) -> Optional[Dict]:
         "outputFolder": _normalize_nas(output),
         "limit": limit,
         "install_fonts": bool(re.search(r"\bfonts?\b", low)),
-        "smoke": bool(re.search(r"\b(smoke|test)\b", low)),
+        "smoke": bool(re.search(r"\bsmoke\b", low)),
     }
     if job["smoke"]:
         job["limit"] = 1
