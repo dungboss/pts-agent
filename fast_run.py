@@ -369,7 +369,7 @@ def _pick_webdav_url(env: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def _copy_nas_template(src: Path, dst: Path, emit: Optional[Callable[[str], None]] = None) -> List[str]:
+def _copy_nas_template(src: Path, dst: Path) -> List[str]:
     """Copy .psd + font từ template NAS về local (top-level + fonts/)."""
     if not src.is_dir():
         raise FastPathError("Template trên NAS không tồn tại: %s" % src)
@@ -381,8 +381,6 @@ def _copy_nas_template(src: Path, dst: Path, emit: Optional[Callable[[str], None
             seen.add(f.name)
             shutil.copy2(str(f), str(target_dir / f.name))
             copied.append(f.name)
-            if emit:
-                emit("📥 Đã tải template: %d file" % len(copied))
 
     for f in sorted(src.iterdir()):
         if f.is_file():
@@ -399,18 +397,15 @@ def _copy_nas_template(src: Path, dst: Path, emit: Optional[Callable[[str], None
     return copied
 
 
-def _copy_design(src: Path, dst: Path, emit: Optional[Callable[[str], None]] = None) -> List[str]:
+def _copy_design(src: Path, dst: Path) -> List[str]:
     """Copy ảnh design (jpg/png/tif/psd/gif/ai/eps) từ NAS về local."""
     if not src.is_dir():
         raise FastPathError("Design folder trên NAS không tồn tại: %s" % src)
-    files = sorted(f for f in src.iterdir() if f.is_file() and f.suffix.lower() in DESIGN_EXTS)
-    total = len(files)
     copied: List[str] = []
-    for i, f in enumerate(files, 1):
-        shutil.copy2(str(f), str(dst / f.name))
-        copied.append(f.name)
-        if emit and (i % 25 == 0 or i == total):
-            emit("📥 Đã tải design: %d/%d" % (i, total))
+    for f in sorted(src.iterdir()):
+        if f.is_file() and f.suffix.lower() in DESIGN_EXTS:
+            shutil.copy2(str(f), str(dst / f.name))
+            copied.append(f.name)
     if not copied:
         raise FastPathError("Không thấy file design nào trong: %s" % src)
     return copied
@@ -720,9 +715,9 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                         local_sub = local_root / subdir
                         local_sub.mkdir(parents=True)
                         if kind == "template":
-                            _copy_nas_template(Path(nas_path), local_sub, emit)
+                            _copy_nas_template(Path(nas_path), local_sub)
                         elif kind == "design":
-                            _copy_design(Path(nas_path), local_sub, emit)
+                            _copy_design(Path(nas_path), local_sub)
                         resolved[field] = str(local_sub)
                 else:
                     resolved[field] = _resolve_path(value, script_dir, None)
