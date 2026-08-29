@@ -55,6 +55,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent
 
@@ -551,6 +553,89 @@ def _upload_outputs(
     return count
 
 
+def _webdav_file_sizes(base_url: str, rel: str, user: str, pwd: str) -> Dict[str, int]:
+    """Đọc tên và kích thước file trực tiếp trong thư mục WebDAV."""
+    url = "%s/%s/" % (base_url.rstrip("/"), rel.strip("/"))
+    proc = subprocess.run(
+        [
+            _curl_bin(), "-sS", "-g", "--fail", "-X", "PROPFIND",
+            "-H", "Depth: 1", "-u", "%s:%s" % (user, pwd), url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise FastPathError(
+            "Không đọc được danh sách output trên NAS: "
+            + (proc.stderr.strip() or proc.stdout.strip())[-300:]
+        )
+    try:
+        root = ET.fromstring(proc.stdout)
+    except ET.ParseError as exc:
+        raise FastPathError("NAS trả về dữ liệu PROPFIND không hợp lệ.") from exc
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    result: Dict[str, int] = {}
+    for response in root.iter():
+        if local_name(response.tag) != "response":
+            continue
+        href = ""
+        is_collection = False
+        size: Optional[int] = None
+        for node in response.iter():
+            name = local_name(node.tag)
+            if name == "href" and not href:
+                href = unquote((node.text or "").strip())
+            elif name == "collection":
+                is_collection = True
+            elif name == "getcontentlength":
+                try:
+                    size = int((node.text or "0").strip())
+                except ValueError:
+                    size = None
+        if not href or is_collection or href.endswith("/") or size is None:
+            continue
+        result[href.rstrip("/").rsplit("/", 1)[-1]] = size
+    return result
+
+
+def _verify_uploaded_outputs(
+    local_dir: Path,
+    base_url: str,
+    rel: str,
+    user: str,
+    pwd: str,
+    expected_names: List[str],
+) -> int:
+    """Bắt buộc xác nhận đủ file và đúng kích thước trên NAS sau PUT."""
+    if not expected_names:
+        raise FastPathError("Không có file local để xác nhận upload trên NAS.")
+    remote = _webdav_file_sizes(base_url, rel, user, pwd)
+    missing = [name for name in expected_names if name not in remote]
+    mismatched = []
+    for name in expected_names:
+        if name in missing:
+            continue
+        local_file = local_dir / name
+        try:
+            local_size = local_file.stat().st_size
+        except OSError as exc:
+            raise FastPathError("Không đọc được file local sau upload: %s" % name) from exc
+        if remote[name] != local_size:
+            mismatched.append("%s (%d/%d bytes)" % (name, local_size, remote[name]))
+    if missing or mismatched:
+        details = []
+        if missing:
+            details.append("thiếu %d file: %s" % (len(missing), ", ".join(missing[:3])))
+        if mismatched:
+            details.append("sai kích thước: %s" % ", ".join(mismatched[:3]))
+        raise FastPathError("NAS chưa đủ output (%s)." % "; ".join(details))
+    return len(expected_names)
+
+
 # --- helpers dùng chung ------------------------------------------------------
 
 def _resolve_path(value: str, script_dir: Path, mount_point: Optional[str]) -> str:
@@ -990,9 +1075,22 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                                     pipeline,
                                     only_names=output_names,
                                 )
+                                if uploaded != len(output_names):
+                                    raise FastPathError(
+                                        "PUT được %d/%d ảnh của batch lên NAS."
+                                        % (uploaded, len(output_names))
+                                    )
+                                verified = _verify_uploaded_outputs(
+                                    Path(resolved["outputFolder"]),
+                                    base_url,
+                                    rel,
+                                    user,
+                                    pwd,
+                                    output_names,
+                                )
                                 emit(
-                                    "✅ Đã upload %d ảnh của batch lên NAS."
-                                    % uploaded
+                                    "✅ Đã upload và xác nhận %d ảnh của batch trên NAS."
+                                    % verified
                                 )
                                 batch_success = True
                             except Exception as exc:
@@ -1077,6 +1175,39 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 _close_photoshop()
 
         count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
+
+        # Tri/age và mockup output local chạy một lần: upload xong phải xác nhận
+        # đủ file trên NAS trước khi được phép báo thành công.
+        if upload_target and success and not is_batched_mockup:
+            expected_names = [
+                f.name
+                for f in sorted(Path(resolved["outputFolder"]).iterdir())
+                if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
+            ]
+            base_url, user, pwd, rel = upload_target
+            emit("⬆️ Upload kết quả lên NAS...")
+            _ensure_webdav_dir(base_url, rel, user, pwd)
+            uploaded = _upload_outputs(
+                Path(resolved["outputFolder"]),
+                base_url,
+                rel,
+                user,
+                pwd,
+                pipeline,
+            )
+            if uploaded != len(expected_names):
+                raise FastPathError(
+                    "PUT được %d/%d ảnh lên NAS." % (uploaded, len(expected_names))
+                )
+            verified = _verify_uploaded_outputs(
+                Path(resolved["outputFolder"]),
+                base_url,
+                rel,
+                user,
+                pwd,
+                expected_names,
+            )
+            emit("✅ Đã upload và xác nhận %d ảnh trên NAS." % verified)
 
         lines = []
         if success:
