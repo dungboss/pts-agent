@@ -469,7 +469,11 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
     seen = set()
 
     def _copy_file(f: Path, target_dir: Path) -> None:
-        if (f.suffix.lower() == ".psd" or f.suffix.lower() in FONT_EXTS) and f.name not in seen:
+        if (
+            (f.suffix.lower() == ".psd" or f.suffix.lower() in FONT_EXTS)
+            and f.name not in seen
+            and _is_nonempty_file(f)
+        ):
             seen.add(f.name)
             shutil.copy2(str(f), str(target_dir / f.name))
             copied.append(f.name)
