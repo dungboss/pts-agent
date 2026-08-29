@@ -99,7 +99,8 @@ PIPELINE_FOLDERS = {
     },
 }
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
-DESIGN_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".gif", ".ai", ".eps"}
+# Mockup chỉ nhận đúng hai định dạng design này; phải đồng bộ với mockup-script.jsx.
+DESIGN_EXTS = {".jpg", ".png"}
 MOCKUP_BATCH_SIZE = 100
 MOCKUP_BATCH_MAX_ATTEMPTS = 3
 PHOTOSHOP_MAX_ATTEMPTS = 3
@@ -489,7 +490,7 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
 
 
 def _copy_design(src: Path, dst: Path) -> List[str]:
-    """Copy ảnh design (jpg/png/tif/psd/gif/ai/eps) từ NAS về local."""
+    """Copy ảnh design (chỉ jpg/png) từ NAS về local."""
     if not src.is_dir():
         raise FastPathError("Design folder trên NAS không tồn tại: %s" % src)
     copied: List[str] = []
