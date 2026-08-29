@@ -666,21 +666,41 @@ def _font_dir() -> Path:
 
 
 def scan_rules(folder: Path) -> List[Dict]:
-    """Quét .psd trong thư mục template, lấy số ở đuôi tên file làm độ dài tên (tri)."""
+    """Tạo rule tri từ tên PSD: ``5.psd`` = 5, ``5-6.psd`` = 5..6."""
     if not folder.is_dir():
         raise FastPathError("Template folder không tồn tại: %s" % folder)
     rules: List[Dict] = []
     for f in sorted(folder.iterdir()):
         if f.suffix.lower() != ".psd":
             continue
-        m = re.search(r"(\d+)\s*\.psd$", f.name, re.IGNORECASE)
-        if not m:
-            continue
-        rules.append({"min": int(m.group(1)), "max": int(m.group(1)), "template": f.name})
-    rules.sort(key=lambda r: (r["min"], r["template"]))
+        stem = f.stem
+        range_match = re.search(r"(\d+)\s*-\s*(\d+)\s*$", stem)
+        if range_match:
+            min_value = int(range_match.group(1))
+            max_value = int(range_match.group(2))
+        else:
+            single_match = re.search(r"(\d+)\s*$", stem)
+            if not single_match:
+                continue
+            min_value = max_value = int(single_match.group(1))
+        if max_value < min_value:
+            raise FastPathError(
+                "Tên template không hợp lệ (khoảng ngược): %s" % f.name
+            )
+        rules.append({"min": min_value, "max": max_value, "template": f.name})
+    rules.sort(key=lambda r: (r["min"], r["max"], r["template"]))
+    for previous, current in zip(rules, rules[1:]):
+        if current["min"] <= previous["max"]:
+            raise FastPathError(
+                "Các template tri bị chồng khoảng: %s (%d-%d) và %s (%d-%d)."
+                % (
+                    previous["template"], previous["min"], previous["max"],
+                    current["template"], current["min"], current["max"],
+                )
+            )
     if not rules:
         raise FastPathError(
-            "Không tìm thấy file .psd đánh số (vd 2.psd..11.psd) trong template — để agent xử lý."
+            "Không tìm thấy file .psd đánh số hoặc có khoảng (vd 2.psd, 5-6.psd) trong template — để agent xử lý."
         )
     return rules
 
