@@ -30,6 +30,8 @@ Hỗ trợ 3 pipeline: `tri`, `age`, `mockup`. Cú pháp:
 
 Khi output mockup nằm trên NAS, fast-path tự chạy theo batch 100 design, upload
 từng batch rồi đóng Photoshop hoàn toàn trước khi mở lại cho batch kế tiếp.
+Lỗi Photoshop, timeout, done khác OK hoặc lỗi upload sẽ tự thử lại tối đa 3 lần
+cho cùng batch; đổi bằng `MOCKUP_BATCH_MAX_ATTEMPTS`.
 
 Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh "<toàn bộ lệnh>"`
 bằng ĐÚNG 1 tool thay vì nhiều vòng.
@@ -96,6 +98,7 @@ PIPELINE_FOLDERS = {
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
 DESIGN_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".gif", ".ai", ".eps"}
 MOCKUP_BATCH_SIZE = 100
+MOCKUP_BATCH_MAX_ATTEMPTS = 3
 IS_WINDOWS = os.name == "nt"
 
 
@@ -884,6 +887,9 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 emit("🔤 Đã cài font: " + ", ".join(fonts))
 
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
+        mockup_attempts = _env_int(
+            "MOCKUP_BATCH_MAX_ATTEMPTS", MOCKUP_BATCH_MAX_ATTEMPTS
+        )
         # Mockup output trên NAS chạy theo batch để Photoshop không phải xử lý
         # hàng trăm lần mở/đóng Smart Object trong cùng một phiên.
         # Các pipeline khác vẫn giữ nguyên luồng chạy một lần.
@@ -907,52 +913,112 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 batch_end = min(batch_start + MOCKUP_BATCH_SIZE, total_to_process)
                 batch_names = design_names[batch_start:batch_end]
                 output_names = [Path(name).stem + ".jpg" for name in batch_names]
-                cfg = _build_config(
-                    job,
-                    resolved,
-                    script_dir,
-                    mockup_start=batch_start,
-                    mockup_limit=len(batch_names),
-                )
-                config_path.write_text(
-                    json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                if batch_start == 0:
-                    emit(_config_summary(job, cfg))
-                emit(
-                    "🚀 Chạy mockup batch %d-%d/%d (Photoshop xử lý tối đa %d file)..."
-                    % (batch_start + 1, batch_end, total_to_process, MOCKUP_BATCH_SIZE)
-                )
-                proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-                if proc.timed_out:
-                    return "❌ Timeout — %s batch %d-%d (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (
-                        pipeline, batch_start + 1, batch_end, timeout,
+                batch_success = False
+                batch_error = ""
+                for attempt in range(1, mockup_attempts + 1):
+                    cfg = _build_config(
+                        job,
+                        resolved,
+                        script_dir,
+                        mockup_start=batch_start,
+                        mockup_limit=len(batch_names),
                     )
-
-                status = ""
-                if done_file.is_file():
+                    config_path.write_text(
+                        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    if batch_start == 0 and attempt == 1:
+                        emit(_config_summary(job, cfg))
+                    emit(
+                        "🚀 Chạy mockup batch %d-%d/%d (lần thử %d/%d)..."
+                        % (
+                            batch_start + 1,
+                            batch_end,
+                            total_to_process,
+                            attempt,
+                            mockup_attempts,
+                        )
+                    )
                     try:
-                        status = done_file.read_text(encoding="utf-8").strip()
-                    except OSError:
-                        status = "?"
-                tail = (proc.stdout or "").strip()[-1200:]
-                success = proc.returncode == 0 and status == "OK"
-                if not success:
-                    break
+                        proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+                    except Exception as exc:
+                        proc = _ProcResult(1, "", "")
+                        batch_error = "runner: %s" % str(exc)[-300:]
+                        status = "RUNNER_ERROR"
+                        tail = "Batch error: " + batch_error
+                        if attempt >= mockup_attempts:
+                            break
+                        if (ROOT / ".cancel-flag").exists():
+                            cancelled = True
+                            break
+                        emit(
+                            "⚠️ Mockup batch %d-%d lỗi (%s) — tự khởi động lại Photoshop "
+                            "và chạy lại..."
+                            % (batch_start + 1, batch_end, batch_error)
+                        )
+                        _close_photoshop()
+                        continue
+                    if proc.timed_out:
+                        batch_error = "timeout sau %ds" % timeout
+                        status = "TIMEOUT"
+                    else:
+                        status = ""
+                        if done_file.is_file():
+                            try:
+                                status = done_file.read_text(encoding="utf-8").strip()
+                            except OSError:
+                                status = "?"
+                        tail = (proc.stdout or "").strip()[-1200:]
+                        if proc.returncode != 0 or status != "OK":
+                            batch_error = "exit %s, done=%s" % (
+                                proc.returncode,
+                                status or "MISSING",
+                            )
+                        else:
+                            try:
+                                emit(
+                                    "⬆️ Upload batch %d-%d lên NAS..."
+                                    % (batch_start + 1, batch_end)
+                                )
+                                base_url, user, pwd, rel = upload_target
+                                _ensure_webdav_dir(base_url, rel, user, pwd)
+                                uploaded = _upload_outputs(
+                                    Path(resolved["outputFolder"]),
+                                    base_url,
+                                    rel,
+                                    user,
+                                    pwd,
+                                    pipeline,
+                                    only_names=output_names,
+                                )
+                                emit(
+                                    "✅ Đã upload %d ảnh của batch lên NAS."
+                                    % uploaded
+                                )
+                                batch_success = True
+                            except Exception as exc:
+                                batch_error = "upload: %s" % str(exc)[-300:]
 
-                emit("⬆️ Upload batch %d-%d lên NAS..." % (batch_start + 1, batch_end))
-                base_url, user, pwd, rel = upload_target
-                _ensure_webdav_dir(base_url, rel, user, pwd)
-                uploaded = _upload_outputs(
-                    Path(resolved["outputFolder"]),
-                    base_url,
-                    rel,
-                    user,
-                    pwd,
-                    pipeline,
-                    only_names=output_names,
-                )
-                emit("✅ Đã upload %d ảnh của batch lên NAS." % uploaded)
+                    if batch_success:
+                        break
+                    if attempt >= mockup_attempts:
+                        break
+                    if (ROOT / ".cancel-flag").exists():
+                        cancelled = True
+                        break
+                    emit(
+                        "⚠️ Mockup batch %d-%d lỗi (%s) — tự khởi động lại Photoshop "
+                        "và chạy lại..."
+                        % (batch_start + 1, batch_end, batch_error)
+                    )
+                    _close_photoshop()
+
+                if cancelled:
+                    break
+                if not batch_success:
+                    success = False
+                    if batch_error:
+                        tail = (tail + "\nBatch error: " + batch_error).strip()
+                    break
 
                 if batch_end < total_to_process:
                     if (ROOT / ".cancel-flag").exists():
@@ -970,20 +1036,45 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
             cfg = _build_config(job, resolved, script_dir)
             config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
             emit(_config_summary(job, cfg))
-            emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
-            proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-            if proc.timed_out:
-                return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
-
-            status = ""
-            if done_file.is_file():
+            is_retryable_mockup = pipeline == "mockup"
+            for attempt in range(1, (mockup_attempts if is_retryable_mockup else 1) + 1):
+                emit(
+                    "🚀 Chạy run-%s (lần thử %d/%d)..."
+                    % (pipeline, attempt, mockup_attempts if is_retryable_mockup else 1)
+                )
+                runner_error = False
                 try:
-                    status = done_file.read_text(encoding="utf-8").strip()
-                except OSError:
-                    status = "?"
-            tail = (proc.stdout or "").strip()[-1200:]
-            success = proc.returncode == 0 and status == "OK"
-            final_returncode = proc.returncode
+                    proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+                except Exception as exc:
+                    proc = _ProcResult(1, "", "")
+                    status = "RUNNER_ERROR"
+                    tail = "Runner error: " + str(exc)[-300:]
+                    success = False
+                    runner_error = True
+                if proc.timed_out:
+                    status = "TIMEOUT"
+                    tail = ""
+                    success = False
+                elif not runner_error:
+                    status = ""
+                    if done_file.is_file():
+                        try:
+                            status = done_file.read_text(encoding="utf-8").strip()
+                        except OSError:
+                            status = "?"
+                    tail = (proc.stdout or "").strip()[-1200:]
+                    success = proc.returncode == 0 and status == "OK"
+                final_returncode = proc.returncode
+                if success or not is_retryable_mockup or attempt >= mockup_attempts:
+                    break
+                if (ROOT / ".cancel-flag").exists():
+                    final_returncode = 130
+                    break
+                emit(
+                    "⚠️ Mockup lỗi (exit %s, done=%s) — tự khởi động lại Photoshop "
+                    "và chạy lại..." % (proc.returncode, status or "MISSING")
+                )
+                _close_photoshop()
 
         count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
 
