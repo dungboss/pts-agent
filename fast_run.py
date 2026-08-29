@@ -31,7 +31,8 @@ Hỗ trợ 3 pipeline: `tri`, `age`, `mockup`. Cú pháp:
 Khi output mockup nằm trên NAS, fast-path tự chạy theo batch 100 design, upload
 từng batch rồi đóng Photoshop hoàn toàn trước khi mở lại cho batch kế tiếp.
 Lỗi Photoshop, timeout, done khác OK hoặc lỗi upload sẽ tự thử lại tối đa 3 lần
-cho cùng batch; đổi bằng `MOCKUP_BATCH_MAX_ATTEMPTS`.
+cho cùng job/batch; tri và age dùng `PHOTOSHOP_MAX_ATTEMPTS`, mockup có thể
+ghi đè bằng `MOCKUP_BATCH_MAX_ATTEMPTS`.
 
 Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh "<toàn bộ lệnh>"`
 bằng ĐÚNG 1 tool thay vì nhiều vòng.
@@ -101,6 +102,7 @@ FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
 DESIGN_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".gif", ".ai", ".eps"}
 MOCKUP_BATCH_SIZE = 100
 MOCKUP_BATCH_MAX_ATTEMPTS = 3
+PHOTOSHOP_MAX_ATTEMPTS = 3
 IS_WINDOWS = os.name == "nt"
 
 
@@ -972,12 +974,14 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 emit("🔤 Đã cài font: " + ", ".join(fonts))
 
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
-        mockup_attempts = _env_int(
-            "MOCKUP_BATCH_MAX_ATTEMPTS", MOCKUP_BATCH_MAX_ATTEMPTS
+        default_attempts = _env_int("PHOTOSHOP_MAX_ATTEMPTS", PHOTOSHOP_MAX_ATTEMPTS)
+        max_attempts = (
+            _env_int("MOCKUP_BATCH_MAX_ATTEMPTS", default_attempts)
+            if pipeline == "mockup" else default_attempts
         )
         # Mockup output trên NAS chạy theo batch để Photoshop không phải xử lý
         # hàng trăm lần mở/đóng Smart Object trong cùng một phiên.
-        # Các pipeline khác vẫn giữ nguyên luồng chạy một lần.
+        # Mockup NAS chạy theo batch; tri/age chạy một job nhưng đều có retry.
         is_batched_mockup = pipeline == "mockup" and upload_target is not None
         if is_batched_mockup:
             design_names = _design_names(Path(resolved["designFolder"]))
@@ -1000,7 +1004,7 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 output_names = [Path(name).stem + ".jpg" for name in batch_names]
                 batch_success = False
                 batch_error = ""
-                for attempt in range(1, mockup_attempts + 1):
+                for attempt in range(1, max_attempts + 1):
                     cfg = _build_config(
                         job,
                         resolved,
@@ -1020,7 +1024,7 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                             batch_end,
                             total_to_process,
                             attempt,
-                            mockup_attempts,
+                            max_attempts,
                         )
                     )
                     try:
@@ -1030,7 +1034,7 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                         batch_error = "runner: %s" % str(exc)[-300:]
                         status = "RUNNER_ERROR"
                         tail = "Batch error: " + batch_error
-                        if attempt >= mockup_attempts:
+                        if attempt >= max_attempts:
                             break
                         if (ROOT / ".cancel-flag").exists():
                             cancelled = True
@@ -1098,7 +1102,7 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
 
                     if batch_success:
                         break
-                    if attempt >= mockup_attempts:
+                    if attempt >= max_attempts:
                         break
                     if (ROOT / ".cancel-flag").exists():
                         cancelled = True
@@ -1114,6 +1118,10 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                     break
                 if not batch_success:
                     success = False
+                    final_returncode = (
+                        proc.returncode
+                        if proc is not None and proc.returncode != 0 else 1
+                    )
                     if batch_error:
                         tail = (tail + "\nBatch error: " + batch_error).strip()
                     break
@@ -1134,11 +1142,12 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
             cfg = _build_config(job, resolved, script_dir)
             config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
             emit(_config_summary(job, cfg))
-            is_retryable_mockup = pipeline == "mockup"
-            for attempt in range(1, (mockup_attempts if is_retryable_mockup else 1) + 1):
+            is_retryable_pipeline = pipeline in ("tri", "age", "mockup")
+            attempt_limit = max_attempts if is_retryable_pipeline else 1
+            for attempt in range(1, attempt_limit + 1):
                 emit(
                     "🚀 Chạy run-%s (lần thử %d/%d)..."
-                    % (pipeline, attempt, mockup_attempts if is_retryable_mockup else 1)
+                    % (pipeline, attempt, attempt_limit)
                 )
                 runner_error = False
                 try:
@@ -1163,51 +1172,55 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                     tail = (proc.stdout or "").strip()[-1200:]
                     success = proc.returncode == 0 and status == "OK"
                 final_returncode = proc.returncode
-                if success or not is_retryable_mockup or attempt >= mockup_attempts:
+                if success and upload_target:
+                    try:
+                        expected_names = [
+                            f.name
+                            for f in sorted(Path(resolved["outputFolder"]).iterdir())
+                            if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
+                        ]
+                        base_url, user, pwd, rel = upload_target
+                        emit("⬆️ Upload kết quả lên NAS...")
+                        _ensure_webdav_dir(base_url, rel, user, pwd)
+                        uploaded = _upload_outputs(
+                            Path(resolved["outputFolder"]),
+                            base_url,
+                            rel,
+                            user,
+                            pwd,
+                            pipeline,
+                        )
+                        if uploaded != len(expected_names):
+                            raise FastPathError(
+                                "PUT được %d/%d ảnh lên NAS."
+                                % (uploaded, len(expected_names))
+                            )
+                        verified = _verify_uploaded_outputs(
+                            Path(resolved["outputFolder"]),
+                            base_url,
+                            rel,
+                            user,
+                            pwd,
+                            expected_names,
+                        )
+                        emit("✅ Đã upload và xác nhận %d ảnh trên NAS." % verified)
+                    except Exception as exc:
+                        status = "UPLOAD_ERROR"
+                        tail = "Upload error: " + str(exc)[-300:]
+                        final_returncode = 1
+                        success = False
+                if success or not is_retryable_pipeline or attempt >= attempt_limit:
                     break
                 if (ROOT / ".cancel-flag").exists():
                     final_returncode = 130
                     break
                 emit(
-                    "⚠️ Mockup lỗi (exit %s, done=%s) — tự khởi động lại Photoshop "
-                    "và chạy lại..." % (proc.returncode, status or "MISSING")
+                    "⚠️ %s lỗi (exit %s, done=%s) — tự khởi động lại Photoshop "
+                    "và chạy lại..." % (pipeline, final_returncode, status or "MISSING")
                 )
                 _close_photoshop()
 
         count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
-
-        # Tri/age và mockup output local chạy một lần: upload xong phải xác nhận
-        # đủ file trên NAS trước khi được phép báo thành công.
-        if upload_target and success and not is_batched_mockup:
-            expected_names = [
-                f.name
-                for f in sorted(Path(resolved["outputFolder"]).iterdir())
-                if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
-            ]
-            base_url, user, pwd, rel = upload_target
-            emit("⬆️ Upload kết quả lên NAS...")
-            _ensure_webdav_dir(base_url, rel, user, pwd)
-            uploaded = _upload_outputs(
-                Path(resolved["outputFolder"]),
-                base_url,
-                rel,
-                user,
-                pwd,
-                pipeline,
-            )
-            if uploaded != len(expected_names):
-                raise FastPathError(
-                    "PUT được %d/%d ảnh lên NAS." % (uploaded, len(expected_names))
-                )
-            verified = _verify_uploaded_outputs(
-                Path(resolved["outputFolder"]),
-                base_url,
-                rel,
-                user,
-                pwd,
-                expected_names,
-            )
-            emit("✅ Đã upload và xác nhận %d ảnh trên NAS." % verified)
 
         lines = []
         if success:
