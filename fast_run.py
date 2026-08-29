@@ -111,6 +111,47 @@ def _local_run_dir(pipeline: str) -> Path:
     return ROOT / "local-run" / pipeline
 
 
+def _rmtree_quiet(path: Path, retries: int = 5, delay: float = 0.5) -> None:
+    """Xoá cả cây, thử lại vài lần — trên Windows file có thể bị khoá tạm thời
+    (Photoshop còn mở, antivirus đang quét) làm rmtree(ignore_errors=True) fail
+    im lặng và để lại thư mục cũ."""
+    for _ in range(retries):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return
+        time.sleep(delay)
+
+
+def _reset_local_dir(local_root: Path, emit: Optional[Callable[[str], None]] = None) -> None:
+    """Dọn sạch local-run/<pipeline> rồi tạo lại cho lần chạy mới.
+
+    Không crash nếu còn file bị khoá (WinError 183): thử xoá cả cây nhiều lần,
+    còn sót thì xoá từng entry nào xoá được, và mkdir với exist_ok=True.
+    """
+    _rmtree_quiet(local_root)
+    leftovers: List[str] = []
+    if local_root.exists():
+        # rmtree vẫn không xoá được hết (file đang bị khoá): xoá từng entry
+        # nào xoá được để tránh dính file cũ của lần chạy trước.
+        for entry in sorted(local_root.iterdir()):
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if entry.exists():
+                leftovers.append(entry.name)
+        if leftovers and emit:
+            emit(
+                "⚠️ Không xoá được %d file cũ trong local-run (đang bị khoá) — "
+                "chạy tiếp, có thể dính file cũ: %s"
+                % (len(leftovers), ", ".join(leftovers[:5]))
+            )
+    local_root.mkdir(parents=True, exist_ok=True)
+
+
 def _curl_bin() -> str:
     """curl.exe trên Windows (tránh alias PowerShell), curl trên macOS/Linux."""
     return "curl.exe" if IS_WINDOWS else "curl"
@@ -948,9 +989,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
             user = nas_env.get("WEBDAV_USERNAME", "")
             pwd = nas_env.get("WEBDAV_PASSWORD", "")
 
-            if local_root.exists():
-                shutil.rmtree(local_root, ignore_errors=True)
-            local_root.mkdir(parents=True)
+            _reset_local_dir(local_root, emit)
 
             for field, (subdir, kind) in folders.items():
                 value = job.get(field)
@@ -960,7 +999,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                     nas_path = _resolve_path(value, script_dir, mount_point)
                     if kind == "output":
                         local_out = local_root / subdir
-                        local_out.mkdir(parents=True)
+                        local_out.mkdir(parents=True, exist_ok=True)
                         resolved[field] = str(local_out)
                         rel = value[len("[NAS]"):].lstrip("/")
                         base_url = _pick_webdav_url(nas_env)
@@ -970,7 +1009,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                         report_output = value
                     else:
                         local_sub = local_root / subdir
-                        local_sub.mkdir(parents=True)
+                        local_sub.mkdir(parents=True, exist_ok=True)
                         if kind == "template":
                             _copy_nas_template(Path(nas_path), local_sub)
                         elif kind == "design":
@@ -1272,7 +1311,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
         return "\n".join(lines)
     finally:
         if needs_nas:
-            shutil.rmtree(local_root, ignore_errors=True)
+            _rmtree_quiet(local_root)
 
 
 def main(argv: List[str]) -> int:
