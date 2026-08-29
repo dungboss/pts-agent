@@ -58,7 +58,7 @@ Sau mỗi lần chạy xong, xoá các file tạm Photoshop sinh ra trong thư m
 - `._*` — metadata AppleDouble của macOS khi ghi lên NAS.
 - `*.sb-*` — file tạm 0 byte của Photoshop Save-for-Web khi ghi lên ổ mạng.
 
-Wrapper `run-*.sh` đã tự dọn. Nếu còn sót, dùng:
+Wrapper `run-*.sh` / `run-*.bat` đã tự dọn. Nếu còn sót, dùng:
 
 ```
 find <output> -maxdepth 1 \( -name '._*' -o -name '*.sb-*' \) -delete
