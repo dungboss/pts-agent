@@ -495,12 +495,21 @@ def _copy_design(src: Path, dst: Path) -> List[str]:
         raise FastPathError("Design folder trên NAS không tồn tại: %s" % src)
     copied: List[str] = []
     for f in sorted(src.iterdir()):
-        if f.is_file() and f.suffix.lower() in DESIGN_EXTS:
-            shutil.copy2(str(f), str(dst / f.name))
-            copied.append(f.name)
+        if f.suffix.lower() not in DESIGN_EXTS or not _is_nonempty_file(f):
+            continue
+        shutil.copy2(str(f), str(dst / f.name))
+        copied.append(f.name)
     if not copied:
         raise FastPathError("Không thấy file design nào trong: %s" % src)
     return copied
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    """True nếu path là file và có ít nhất 1 byte; lỗi stat thì coi như không hợp lệ."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _ensure_webdav_dir(base_url: str, rel: str, user: str, pwd: str) -> None:
@@ -762,7 +771,7 @@ def _design_names(folder: Path) -> List[str]:
     try:
         return sorted(
             f.name for f in folder.iterdir()
-            if f.is_file() and f.suffix.lower() in DESIGN_EXTS
+            if f.suffix.lower() in DESIGN_EXTS and _is_nonempty_file(f)
         )
     except OSError as exc:
         raise FastPathError("Không đọc được thư mục design: %s" % folder) from exc
