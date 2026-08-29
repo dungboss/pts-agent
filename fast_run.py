@@ -28,6 +28,9 @@ Hỗ trợ 3 pipeline: `tri`, `age`, `mockup`. Cú pháp:
   outputFolder: [NAS]/...
   limit: 0
 
+Khi output mockup nằm trên NAS, fast-path tự chạy theo batch 100 design, upload
+từng batch rồi đóng Photoshop hoàn toàn trước khi mở lại cho batch kế tiếp.
+
 Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh "<toàn bộ lệnh>"`
 bằng ĐÚNG 1 tool thay vì nhiều vòng.
 
@@ -47,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -91,6 +95,7 @@ PIPELINE_FOLDERS = {
 }
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
 DESIGN_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".psd", ".gif", ".ai", ".eps"}
+MOCKUP_BATCH_SIZE = 100
 IS_WINDOWS = os.name == "nt"
 
 
@@ -506,12 +511,27 @@ def _output_exts(pipeline: str) -> Tuple[str, ...]:
     return (".jpg", ".jpeg") if pipeline == "mockup" else (".png",)
 
 
-def _upload_outputs(local_dir: Path, base_url: str, rel: str, user: str, pwd: str, pipeline: str) -> int:
-    """Upload từng file kết quả bằng WebDAV PUT (curl -T). Trả số file đã upload."""
+def _upload_outputs(
+    local_dir: Path,
+    base_url: str,
+    rel: str,
+    user: str,
+    pwd: str,
+    pipeline: str,
+    only_names: Optional[List[str]] = None,
+) -> int:
+    """Upload từng file kết quả bằng WebDAV PUT (curl -T). Trả số file đã upload.
+
+    only_names dùng cho mockup batch: chỉ upload ảnh của batch vừa chạy, tránh
+    upload lại toàn bộ output local sau mỗi lần restart Photoshop.
+    """
     exts = _output_exts(pipeline)
+    allowed = set(only_names) if only_names is not None else None
     count = 0
     for f in sorted(local_dir.iterdir()):
         if f.suffix.lower() not in exts:
+            continue
+        if allowed is not None and f.name not in allowed:
             continue
         # -g/--globoff: tắt glob URL — tên file có ký tự [ ] (vd "[[name]2]..." trong
         # tri) nếu không sẽ bị curl hiểu nhầm thành range và báo "bad range".
@@ -626,6 +646,17 @@ def install_fonts(folder: Path) -> List[str]:
     return installed
 
 
+def _design_names(folder: Path) -> List[str]:
+    """Lấy danh sách design theo đúng thứ tự batch của mockup."""
+    try:
+        return sorted(
+            f.name for f in folder.iterdir()
+            if f.is_file() and f.suffix.lower() in DESIGN_EXTS
+        )
+    except OSError as exc:
+        raise FastPathError("Không đọc được thư mục design: %s" % folder) from exc
+
+
 def _count_output(folder: Path, pipeline: str, timeout: float = 20.0) -> int:
     exts = _output_exts(pipeline)
 
@@ -650,7 +681,13 @@ def _count_output(folder: Path, pipeline: str, timeout: float = 20.0) -> int:
     return result.get("n", 0)
 
 
-def _build_config(job: Dict, resolved: Dict[str, str], script_dir: Path) -> Dict:
+def _build_config(
+    job: Dict,
+    resolved: Dict[str, str],
+    script_dir: Path,
+    mockup_start: int = 0,
+    mockup_limit: Optional[int] = None,
+) -> Dict:
     """Sinh config JSON cho từng pipeline từ đường dẫn đã resolve."""
     pipeline = job["pipeline"]
     if pipeline == "tri":
@@ -677,7 +714,8 @@ def _build_config(job: Dict, resolved: Dict[str, str], script_dir: Path) -> Dict
         "templateFolder": resolved["templateFolder"],
         "designFolder": resolved["designFolder"],
         "outputFolder": resolved["outputFolder"],
-        "limit": job.get("limit", 0),
+        "start": mockup_start,
+        "limit": job.get("limit", 0) if mockup_limit is None else mockup_limit,
     }
 
 
@@ -733,6 +771,24 @@ def _close_photoshop() -> None:
         )
     except subprocess.TimeoutExpired:
         pass
+
+    # Quit của macOS là bất đồng bộ. Chờ process biến mất để batch kế tiếp không
+    # gửi do javascript vào một Photoshop đang ở trạng thái đóng dở.
+    pattern = "/Applications/.*/%s.app/Contents/MacOS/%s$" % (
+        re.escape(ps_app), re.escape(ps_app),
+    )
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            running = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            running = ""
+        if not running:
+            return
+        time.sleep(0.5)
 
 
 def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
@@ -811,10 +867,6 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
                 if kind == "output":
                     report_output = resolved[field]
 
-        cfg = _build_config(job, resolved, script_dir)
-        config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        emit(_config_summary(job, cfg))
-
         # Tạo thư mục output trước khi chạy nếu chưa tồn tại (local + NAS)
         out_dir = Path(resolved.get("outputFolder", ""))
         if out_dir:
@@ -831,43 +883,123 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
             if fonts:
                 emit("🔤 Đã cài font: " + ", ".join(fonts))
 
-        emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
         timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
-        proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-        if proc.timed_out:
-            return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
+        # Mockup output trên NAS chạy theo batch để Photoshop không phải xử lý
+        # hàng trăm lần mở/đóng Smart Object trong cùng một phiên.
+        # Các pipeline khác vẫn giữ nguyên luồng chạy một lần.
+        is_batched_mockup = pipeline == "mockup" and upload_target is not None
+        if is_batched_mockup:
+            design_names = _design_names(Path(resolved["designFolder"]))
+            requested_limit = int(job.get("limit", 0) or 0)
+            total_to_process = (
+                min(requested_limit, len(design_names))
+                if requested_limit > 0 else len(design_names)
+            )
+            if total_to_process == 0:
+                raise FastPathError("Không thấy design nào để chạy: %s" % resolved["designFolder"])
 
-        status = ""
-        if done_file.is_file():
-            try:
-                status = done_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                status = "?"
+            proc = None
+            status = ""
+            tail = ""
+            success = True
+            cancelled = False
+            for batch_start in range(0, total_to_process, MOCKUP_BATCH_SIZE):
+                batch_end = min(batch_start + MOCKUP_BATCH_SIZE, total_to_process)
+                batch_names = design_names[batch_start:batch_end]
+                output_names = [Path(name).stem + ".jpg" for name in batch_names]
+                cfg = _build_config(
+                    job,
+                    resolved,
+                    script_dir,
+                    mockup_start=batch_start,
+                    mockup_limit=len(batch_names),
+                )
+                config_path.write_text(
+                    json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                if batch_start == 0:
+                    emit(_config_summary(job, cfg))
+                emit(
+                    "🚀 Chạy mockup batch %d-%d/%d (Photoshop xử lý tối đa %d file)..."
+                    % (batch_start + 1, batch_end, total_to_process, MOCKUP_BATCH_SIZE)
+                )
+                proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+                if proc.timed_out:
+                    return "❌ Timeout — %s batch %d-%d (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (
+                        pipeline, batch_start + 1, batch_end, timeout,
+                    )
+
+                status = ""
+                if done_file.is_file():
+                    try:
+                        status = done_file.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        status = "?"
+                tail = (proc.stdout or "").strip()[-1200:]
+                success = proc.returncode == 0 and status == "OK"
+                if not success:
+                    break
+
+                emit("⬆️ Upload batch %d-%d lên NAS..." % (batch_start + 1, batch_end))
+                base_url, user, pwd, rel = upload_target
+                _ensure_webdav_dir(base_url, rel, user, pwd)
+                uploaded = _upload_outputs(
+                    Path(resolved["outputFolder"]),
+                    base_url,
+                    rel,
+                    user,
+                    pwd,
+                    pipeline,
+                    only_names=output_names,
+                )
+                emit("✅ Đã upload %d ảnh của batch lên NAS." % uploaded)
+
+                if batch_end < total_to_process:
+                    if (ROOT / ".cancel-flag").exists():
+                        cancelled = True
+                        break
+                    emit("♻️ Đóng Photoshop để khởi động lại cho batch kế tiếp...")
+                    _close_photoshop()
+
+            if cancelled:
+                success = False
+                final_returncode = 130
+            else:
+                final_returncode = proc.returncode if proc is not None else 1
+        else:
+            cfg = _build_config(job, resolved, script_dir)
+            config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            emit(_config_summary(job, cfg))
+            emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
+            proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
+            if proc.timed_out:
+                return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
+
+            status = ""
+            if done_file.is_file():
+                try:
+                    status = done_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    status = "?"
+            tail = (proc.stdout or "").strip()[-1200:]
+            success = proc.returncode == 0 and status == "OK"
+            final_returncode = proc.returncode
+
         count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
-        tail = (proc.stdout or "").strip()[-1200:]
-
-        success = proc.returncode == 0 and status == "OK"
-
-        if upload_target and success:
-            emit("⬆️ Upload kết quả lên NAS...")
-            base_url, user, pwd, rel = upload_target
-            _ensure_webdav_dir(base_url, rel, user, pwd)
-            uploaded = _upload_outputs(Path(resolved["outputFolder"]), base_url, rel, user, pwd, pipeline)
-            emit("✅ Đã upload %d ảnh lên NAS." % uploaded)
 
         lines = []
         if success:
             lines.append("✅ Xong — %s: %d ảnh, exit OK." % (pipeline, count))
-        elif proc.returncode == 130:
+        elif final_returncode == 130:
             lines.append("⛔ Đã huỷ — %s." % pipeline)
         else:
-            lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, proc.returncode, status or "MISSING"))
+            lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, final_returncode, status or "MISSING"))
         lines.append("Output: %s" % report_output)
-        if not success and proc.returncode not in (0, 130) and tail:
+        if not success and final_returncode not in (0, 130) and tail:
             lines.append("Log (cuối):\n" + tail)
 
         # Tắt Photoshop sau mỗi lần chạy (trừ khi bị huỷ) — job kế tự mở lại khi cần
-        if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
+        if final_returncode != 130 and not (ROOT / ".cancel-flag").exists():
             _close_photoshop()
 
         return "\n".join(lines)
