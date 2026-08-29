@@ -912,14 +912,12 @@ def _close_photoshop() -> None:
 
 
 def run_job(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """Chạy job pipeline (tri/age/mockup) và trả về báo cáo ngắn gọn. Không gọi LLM."""
-    if IS_WINDOWS:
-        return _run_windows(job, log)
-    return _run_macos(job, log)
+    """Chạy pipeline với cùng workflow local-NAS trên macOS và Windows."""
+    return _run_local_workflow(job, log)
 
 
-def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """macOS: chạy local khi dùng NAS (tải template/design về → chạy → upload kết quả)."""
+def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
+    """Chạy local khi dùng NAS trên cả macOS và Windows rồi upload kết quả."""
     def emit(msg: str) -> None:
         if log:
             log(msg)
@@ -1271,84 +1269,6 @@ def _run_macos(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
     finally:
         if needs_nas:
             shutil.rmtree(local_root, ignore_errors=True)
-
-
-def _run_windows(job: Dict, log: Optional[Callable[[str], None]] = None) -> str:
-    """Windows: chạy trực tiếp qua run-<pipeline>.bat (SMB native nhanh, không cần local-run)."""
-    def emit(msg: str) -> None:
-        if log:
-            log(msg)
-
-    pipeline = job["pipeline"]
-    script_dir = ROOT / PIPELINE_DIRS[pipeline]
-    done_file = script_dir / DONE_FILES[pipeline]
-    config_path = script_dir / CONFIG_FILES[pipeline]
-    folders = PIPELINE_FOLDERS[pipeline]
-
-    needs_nas = any(job.get(f, "").startswith("[NAS]") for f in folders)
-    emit("📋 Fast-path: phân tích lệnh (không qua AI)...")
-    mount_point = None
-    if needs_nas:
-        emit("🗂 NAS: kết nối (SMB/UNC hoặc WebDAV)...")
-        mount_point = _mount_point(script_dir)
-
-    resolved: Dict[str, str] = {}
-    report_output = ""
-    for field, (subdir, kind) in folders.items():
-        value = job.get(field)
-        if not value:
-            continue
-        resolved[field] = _resolve_path(value, script_dir, mount_point)
-        if kind == "output":
-            report_output = value if value.startswith("[NAS]") else resolved[field]
-
-    cfg = _build_config(job, resolved, script_dir)
-    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    emit(_config_summary(job, cfg))
-
-    # Tạo thư mục output trước khi chạy nếu chưa tồn tại
-    out_dir = Path(resolved.get("outputFolder", ""))
-    if out_dir:
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-    if job.get("install_fonts"):
-        fonts = install_fonts(Path(resolved.get("templateFolder", "")))
-        if fonts:
-            emit("🔤 Đã cài font: " + ", ".join(fonts))
-
-    emit("🚀 Chạy run-%s (có thể mất nhiều phút)..." % pipeline)
-    timeout = _env_int("FASTPATH_TIMEOUT_SEC", 21600)
-    proc = _run_wrapper(script_dir, pipeline, config_path, timeout)
-    if proc.timed_out:
-        return "❌ Timeout — %s (quá %ds, Photoshop có thể kẹt; gửi /cancel rồi kiểm tra)." % (pipeline, timeout)
-
-    status = ""
-    if done_file.is_file():
-        try:
-            status = done_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            status = "?"
-    count = _count_output(Path(resolved.get("outputFolder", "")), pipeline)
-    tail = (proc.stdout or "").strip()[-1200:]
-
-    success = proc.returncode == 0 and status == "OK"
-    lines = []
-    if success:
-        lines.append("✅ Xong — %s: %d ảnh, exit OK." % (pipeline, count))
-    else:
-        lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, proc.returncode, status or "MISSING"))
-    lines.append("Output: %s" % report_output)
-    if not success and tail:
-        lines.append("Log (cuối):\n" + tail)
-
-    # Tắt Photoshop sau mỗi lần chạy (trừ khi bị huỷ) — job kế tự mở lại khi cần
-    if proc.returncode != 130 and not (ROOT / ".cancel-flag").exists():
-        _close_photoshop()
-
-    return "\n".join(lines)
 
 
 def main(argv: List[str]) -> int:
