@@ -29,10 +29,11 @@ Hỗ trợ 3 pipeline: `tri`, `age`, `mockup`. Cú pháp:
   limit: 0
 
 Khi output mockup nằm trên NAS, fast-path tự chạy theo batch 100 design, upload
-từng batch rồi đóng Photoshop hoàn toàn trước khi mở lại cho batch kế tiếp.
-Lỗi Photoshop, timeout, done khác OK hoặc lỗi upload sẽ tự thử lại tối đa 3 lần
-cho cùng job/batch; tri và age dùng `PHOTOSHOP_MAX_ATTEMPTS`, mockup có thể
-ghi đè bằng `MOCKUP_BATCH_MAX_ATTEMPTS`.
+từng batch rồi đóng Photoshop hoàn toàn trước khi mở lại cho batch kế tiếp. Age
+cũng chia theo batch tối đa 100 ảnh (theo các khoảng năm) và restart Photoshop
+giữa các batch. Lỗi Photoshop, timeout, done khác OK hoặc lỗi upload sẽ tự thử
+lại tối đa 3 lần cho cùng job/batch; tri và age dùng `PHOTOSHOP_MAX_ATTEMPTS`,
+mockup có thể ghi đè bằng `MOCKUP_BATCH_MAX_ATTEMPTS`.
 
 Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh "<toàn bộ lệnh>"`
 bằng ĐÚNG 1 tool thay vì nhiều vòng.
@@ -102,6 +103,7 @@ FONT_EXTS = {".ttf", ".otf", ".ttc", ".dfont"}
 # Mockup chỉ nhận đúng hai định dạng design này; phải đồng bộ với mockup-script.jsx.
 DESIGN_EXTS = {".jpg", ".png"}
 MOCKUP_BATCH_SIZE = 100
+AGE_BATCH_SIZE = 100
 MOCKUP_BATCH_MAX_ATTEMPTS = 3
 PHOTOSHOP_MAX_ATTEMPTS = 3
 IS_WINDOWS = os.name == "nt"
@@ -231,6 +233,24 @@ def _limit(text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _name_filter(text: str) -> Optional[str]:
+    """Parse an exact source-name filter, e.g. 'chỉ chạy với tên sylvie'."""
+    m = re.search(
+        r"(?im)^\s*[-*•]?\s*(?:chỉ\s+chạy\s+với\s+tên|chay\s+voi\s+ten|only\s+name)\s*[:\-]?\s*(.+?)\s*$",
+        text,
+    )
+    return m.group(1).strip() if m else None
+
+
+def _name_length_filter(text: str) -> Optional[int]:
+    """Parse a source-name length filter, e.g. 'tên có độ dài 2 ký tự'."""
+    m = re.search(
+        r"(?im)^\s*[-*•]?\s*[^\r\n]*tên\s+có\s+độ\s+dài\s+(\d+)\s+k[ýy]\s*tự\b",
+        text,
+    )
+    return int(m.group(1)) if m else None
+
+
 def _source_label(text: str) -> Optional[str]:
     low = text.lower()
     if re.search(r"\b(pháp|phap|france|fr)\b", low):
@@ -305,6 +325,8 @@ def _parse_tri(t: str, low: str) -> Optional[Dict]:
         "outputFolder": _normalize_nas(output),
         "outputFormula": formula,
         "limit": _limit(t),
+        "nameFilter": _name_filter(t),
+        "nameLengthFilter": _name_length_filter(t),
         "install_fonts": bool(re.search(r"\bfonts?\b", low)),
         "smoke": bool(re.search(r"\bsmoke\b", low)),
     }
@@ -356,6 +378,7 @@ def _parse_mockup(t: str, low: str) -> Optional[Dict]:
         "designFolder": _normalize_nas(design),
         "outputFolder": _normalize_nas(output),
         "limit": limit,
+        "nameFilter": _name_filter(t),
         "install_fonts": bool(re.search(r"\bfonts?\b", low)),
         "smoke": bool(re.search(r"\bsmoke\b", low)),
     }
@@ -534,17 +557,22 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
     return copied
 
 
-def _copy_design(src: Path, dst: Path) -> List[str]:
+def _copy_design(src: Path, dst: Path, name_filter: Optional[str] = None) -> List[str]:
     """Copy ảnh design (chỉ jpg/png) từ NAS về local."""
     if not src.is_dir():
         raise FastPathError("Design folder trên NAS không tồn tại: %s" % src)
     copied: List[str] = []
+    needle = name_filter.casefold() if name_filter else None
     for f in sorted(src.iterdir()):
         if f.suffix.lower() not in DESIGN_EXTS or not _is_nonempty_file(f):
+            continue
+        if needle and needle not in f.stem.casefold():
             continue
         shutil.copy2(str(f), str(dst / f.name))
         copied.append(f.name)
     if not copied:
+        if name_filter:
+            raise FastPathError("Không thấy design chứa tên '%s' trong: %s" % (name_filter, src))
         raise FastPathError("Không thấy file design nào trong: %s" % src)
     return copied
 
@@ -863,6 +891,8 @@ def _build_config(
             "outputFolder": resolved["outputFolder"],
             "outputFormula": job["outputFormula"],
             "limit": job["limit"],
+            "nameFilter": job.get("nameFilter"),
+            "nameLengthFilter": job.get("nameLengthFilter"),
             "rules": scan_rules(Path(resolved["templateFolder"])),
         }
     if pipeline == "age":
@@ -882,6 +912,116 @@ def _build_config(
         "start": mockup_start,
         "limit": job.get("limit", 0) if mockup_limit is None else mockup_limit,
     }
+
+
+def _age_batch_ranges(from_year: int, to_year: int, month_count: int) -> List[Tuple[int, int]]:
+    """Chia age thành các khoảng năm, mỗi batch không quá AGE_BATCH_SIZE ảnh."""
+    if month_count <= 0:
+        return []
+    years_per_batch = max(1, AGE_BATCH_SIZE // month_count)
+    ranges: List[Tuple[int, int]] = []
+    start = from_year
+    while start <= to_year:
+        end = min(to_year, start + years_per_batch - 1)
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def _run_age_batches(
+    job: Dict,
+    resolved: Dict[str, str],
+    script_dir: Path,
+    config_path: Path,
+    done_file: Path,
+    timeout: int,
+    max_attempts: int,
+    emit: Callable[[str], None],
+) -> Tuple[bool, Optional[_ProcResult], str, str]:
+    """Chạy age theo batch tối đa 100 ảnh, restart Photoshop giữa các batch."""
+    full_cfg = _build_config(job, resolved, script_dir)
+    batch_ranges = _age_batch_ranges(
+        job["fromYear"], job["toYear"], len(full_cfg["months"])
+    )
+    total_batches = len(batch_ranges)
+    total_years = job["toYear"] - job["fromYear"] + 1
+    month_count = len(full_cfg["months"])
+
+    proc: Optional[_ProcResult] = None
+    status = ""
+    tail = ""
+    for batch_index, (batch_from, batch_to) in enumerate(batch_ranges):
+        batch_job = dict(job)
+        batch_job["fromYear"] = batch_from
+        batch_job["toYear"] = batch_to
+        cfg = _build_config(batch_job, resolved, script_dir)
+        config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        batch_size = (batch_to - batch_from + 1) * month_count
+        emit(
+            "🚀 Chạy age batch %d/%d: %d→%d (%d ảnh; tổng %d ảnh)..."
+            % (
+                batch_index + 1,
+                total_batches,
+                batch_from,
+                batch_to,
+                batch_size,
+                total_years * month_count,
+            )
+        )
+
+        batch_success = False
+        for attempt in range(1, max_attempts + 1):
+            emit(
+                "🚀 Chạy run-age batch %d/%d (lần thử %d/%d)..."
+                % (batch_index + 1, total_batches, attempt, max_attempts)
+            )
+            runner_error = False
+            try:
+                proc = _run_wrapper(script_dir, "age", config_path, timeout)
+            except Exception as exc:
+                proc = _ProcResult(1, "", "")
+                status = "RUNNER_ERROR"
+                tail = "Runner error: " + str(exc)[-300:]
+                runner_error = True
+
+            if proc.timed_out:
+                status = "TIMEOUT"
+                tail = ""
+            elif not runner_error:
+                status = ""
+                if done_file.is_file():
+                    try:
+                        status = done_file.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        status = "?"
+                tail = (proc.stdout or "").strip()[-1200:]
+                batch_success = proc.returncode == 0 and status == "OK"
+
+            if batch_success:
+                break
+            if attempt >= max_attempts:
+                break
+            if (ROOT / ".cancel-flag").exists():
+                return False, proc, status, tail
+            emit(
+                "⚠️ Age batch %d/%d lỗi (exit %s, done=%s) — restart Photoshop "
+                "rồi chạy lại..."
+                % (batch_index + 1, total_batches, proc.returncode, status or "MISSING")
+            )
+            _close_photoshop()
+
+        if not batch_success:
+            return False, proc, status, tail
+
+        if batch_index + 1 < total_batches:
+            emit(
+                "♻️ Age batch %d/%d xong — đóng Photoshop trước batch kế tiếp..."
+                % (batch_index + 1, total_batches)
+            )
+            _close_photoshop()
+
+    return True, proc, status, tail
 
 
 def _config_summary(job: Dict, cfg: Dict) -> str:
@@ -1013,7 +1153,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                         if kind == "template":
                             _copy_nas_template(Path(nas_path), local_sub)
                         elif kind == "design":
-                            _copy_design(Path(nas_path), local_sub)
+                            _copy_design(Path(nas_path), local_sub, job.get("nameFilter"))
                         resolved[field] = str(local_sub)
                 else:
                     resolved[field] = _resolve_path(value, script_dir, None)
@@ -1209,6 +1349,20 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                 final_returncode = 130
             else:
                 final_returncode = proc.returncode if proc is not None else 1
+        elif pipeline == "age":
+            cfg = _build_config(job, resolved, script_dir)
+            emit(_config_summary(job, cfg))
+            success, proc, status, tail = _run_age_batches(
+                job,
+                resolved,
+                script_dir,
+                config_path,
+                done_file,
+                timeout,
+                max_attempts,
+                emit,
+            )
+            final_returncode = proc.returncode if proc is not None else 1
         else:
             cfg = _build_config(job, resolved, script_dir)
             config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
