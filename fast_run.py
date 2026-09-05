@@ -39,8 +39,8 @@ Cũng đóng vai trò "1 script gộp": agent có thể gọi `./run-pipeline.sh
 bằng ĐÚNG 1 tool thay vì nhiều vòng.
 
 Tối ưu NAS: khi template/design/output nằm trên NAS (`[NAS]/...`), tải về
-`local-run/<pipeline>/`, chạy local (nhanh hơn đọc WebDAV ~5–10×), rồi upload
-kết quả lên NAS bằng WebDAV PUT (`curl -T`).
+`local-run/<pipeline>/`, chạy local, rồi copy kết quả về share SMB đã mount
+trên máy (WebDAV chỉ là fallback).
 """
 
 from __future__ import annotations
@@ -500,6 +500,37 @@ def _mount_point(script_dir: Path) -> str:
     return lines[-1]
 
 
+def _smb_share_for_mount(mount_point: str) -> Optional[str]:
+    """Trả tên share SMB đang mount tại mount_point trên macOS, nếu có."""
+    if IS_WINDOWS:
+        return None
+    try:
+        proc = subprocess.run(
+            ["mount"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    marker = " on %s (" % mount_point
+    for line in proc.stdout.splitlines():
+        if "smbfs" not in line or marker not in line:
+            continue
+        source = line.split(marker, 1)[0].strip()
+        if "/" in source:
+            return source.rsplit("/", 1)[-1]
+    return None
+
+
+def _resolve_nas_mount_path(value: str, mount_point: str) -> str:
+    """Resolve [NAS] path, bỏ tên share đầu tiên khi mount là SMB trên macOS."""
+    rel = value[len("[NAS]"):].lstrip("/")
+    share = _smb_share_for_mount(mount_point)
+    if share == rel:
+        rel = ""
+    elif share and rel.startswith(share + "/"):
+        rel = rel[len(share) + 1:]
+    return str(Path(mount_point) / rel)
+
+
 def _probe_webdav(url: str, user: str, pwd: str, timeout: int = 4) -> bool:
     proc = subprocess.run(
         [
@@ -636,6 +667,59 @@ def _upload_outputs(
             )
         count += 1
     return count
+
+
+def _copy_outputs_to_smb(
+    local_dir: Path,
+    target_dir: Path,
+    pipeline: str,
+    only_names: Optional[List[str]] = None,
+) -> int:
+    """Copy output ảnh qua share SMB đã mount local. Trả số file đã copy."""
+    exts = _output_exts(pipeline)
+    allowed = set(only_names) if only_names is not None else None
+    target_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for f in sorted(local_dir.iterdir()):
+        if f.suffix.lower() not in exts:
+            continue
+        if allowed is not None and f.name not in allowed:
+            continue
+        shutil.copy2(str(f), str(target_dir / f.name))
+        count += 1
+    return count
+
+
+def _verify_smb_outputs(
+    local_dir: Path,
+    target_dir: Path,
+    expected_names: List[str],
+) -> int:
+    """Xác nhận đủ file và đúng kích thước sau khi copy qua SMB."""
+    if not expected_names:
+        raise FastPathError("Không có file local để xác nhận copy lên NAS.")
+    missing = []
+    mismatched = []
+    for name in expected_names:
+        remote_file = target_dir / name
+        if not _is_nonempty_file(remote_file):
+            missing.append(name)
+            continue
+        try:
+            local_size = (local_dir / name).stat().st_size
+            remote_size = remote_file.stat().st_size
+        except OSError as exc:
+            raise FastPathError("Không đọc được file sau khi copy SMB: %s" % name) from exc
+        if remote_size != local_size:
+            mismatched.append("%s (%d/%d bytes)" % (name, local_size, remote_size))
+    if missing or mismatched:
+        details = []
+        if missing:
+            details.append("thiếu %d file: %s" % (len(missing), ", ".join(missing[:3])))
+        if mismatched:
+            details.append("sai kích thước: %s" % ", ".join(mismatched[:3]))
+        raise FastPathError("NAS chưa đủ output (%s)." % "; ".join(details))
+    return len(expected_names)
 
 
 def _webdav_file_sizes(base_url: str, rel: str, user: str, pwd: str) -> Dict[str, int]:
@@ -1118,6 +1202,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
     emit("📋 Fast-path: phân tích lệnh (không qua AI)...")
 
     upload_target: Optional[Tuple[str, str, str, str]] = None
+    smb_upload_target: Optional[Path] = None
     report_output = ""
 
     try:
@@ -1128,6 +1213,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
             nas_env = _load_nas_env(script_dir)
             user = nas_env.get("WEBDAV_USERNAME", "")
             pwd = nas_env.get("WEBDAV_PASSWORD", "")
+            smb_share = _smb_share_for_mount(mount_point)
 
             _reset_local_dir(local_root, emit)
 
@@ -1136,16 +1222,19 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                 if not value:
                     continue
                 if value.startswith("[NAS]"):
-                    nas_path = _resolve_path(value, script_dir, mount_point)
+                    nas_path = _resolve_nas_mount_path(value, mount_point)
                     if kind == "output":
                         local_out = local_root / subdir
                         local_out.mkdir(parents=True, exist_ok=True)
                         resolved[field] = str(local_out)
-                        rel = value[len("[NAS]"):].lstrip("/")
-                        base_url = _pick_webdav_url(nas_env)
-                        if not base_url:
-                            raise FastPathError("Không tìm được tuyến WebDAV để upload kết quả.")
-                        upload_target = (base_url, user, pwd, rel)
+                        if smb_share:
+                            smb_upload_target = Path(nas_path)
+                        else:
+                            rel = value[len("[NAS]"):].lstrip("/")
+                            base_url = _pick_webdav_url(nas_env)
+                            if not base_url:
+                                raise FastPathError("Không tìm được tuyến WebDAV để upload kết quả.")
+                            upload_target = (base_url, user, pwd, rel)
                         report_output = value
                     else:
                         local_sub = local_root / subdir
@@ -1178,6 +1267,8 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
         if upload_target:
             base_url, user, pwd, rel = upload_target
             _ensure_webdav_dir(base_url, rel, user, pwd)
+        elif smb_upload_target:
+            smb_upload_target.mkdir(parents=True, exist_ok=True)
 
         if job.get("install_fonts"):
             fonts = install_fonts(Path(resolved.get("templateFolder", "")))
@@ -1193,7 +1284,9 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
         # Mockup output trên NAS chạy theo batch để Photoshop không phải xử lý
         # hàng trăm lần mở/đóng Smart Object trong cùng một phiên.
         # Mockup NAS chạy theo batch; tri/age chạy một job nhưng đều có retry.
-        is_batched_mockup = pipeline == "mockup" and upload_target is not None
+        is_batched_mockup = pipeline == "mockup" and (
+            upload_target is not None or smb_upload_target is not None
+        )
         if is_batched_mockup:
             design_names = _design_names(Path(resolved["designFolder"]))
             requested_limit = int(job.get("limit", 0) or 0)
@@ -1279,30 +1372,47 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                                     "⬆️ Upload batch %d-%d lên NAS..."
                                     % (batch_start + 1, batch_end)
                                 )
-                                base_url, user, pwd, rel = upload_target
-                                _ensure_webdav_dir(base_url, rel, user, pwd)
-                                uploaded = _upload_outputs(
-                                    Path(resolved["outputFolder"]),
-                                    base_url,
-                                    rel,
-                                    user,
-                                    pwd,
-                                    pipeline,
-                                    only_names=output_names,
-                                )
+                                if upload_target:
+                                    base_url, user, pwd, rel = upload_target
+                                    _ensure_webdav_dir(base_url, rel, user, pwd)
+                                    uploaded = _upload_outputs(
+                                        Path(resolved["outputFolder"]),
+                                        base_url,
+                                        rel,
+                                        user,
+                                        pwd,
+                                        pipeline,
+                                        only_names=output_names,
+                                    )
+                                elif smb_upload_target:
+                                    uploaded = _copy_outputs_to_smb(
+                                        Path(resolved["outputFolder"]),
+                                        smb_upload_target,
+                                        pipeline,
+                                        only_names=output_names,
+                                    )
+                                else:
+                                    raise FastPathError("Chưa có đích upload NAS.")
                                 if uploaded != len(output_names):
                                     raise FastPathError(
-                                        "PUT được %d/%d ảnh của batch lên NAS."
+                                        "Đã chuyển %d/%d ảnh của batch lên NAS."
                                         % (uploaded, len(output_names))
                                     )
-                                verified = _verify_uploaded_outputs(
-                                    Path(resolved["outputFolder"]),
-                                    base_url,
-                                    rel,
-                                    user,
-                                    pwd,
-                                    output_names,
-                                )
+                                if upload_target:
+                                    verified = _verify_uploaded_outputs(
+                                        Path(resolved["outputFolder"]),
+                                        base_url,
+                                        rel,
+                                        user,
+                                        pwd,
+                                        output_names,
+                                    )
+                                else:
+                                    verified = _verify_smb_outputs(
+                                        Path(resolved["outputFolder"]),
+                                        smb_upload_target,
+                                        output_names,
+                                    )
                                 emit(
                                     "✅ Đã upload và xác nhận %d ảnh của batch trên NAS."
                                     % verified
@@ -1363,36 +1473,50 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                 emit,
             )
             final_returncode = proc.returncode if proc is not None else 1
-            if success and upload_target:
+            if success and (upload_target or smb_upload_target):
                 try:
                     expected_names = [
                         f.name
                         for f in sorted(Path(resolved["outputFolder"]).iterdir())
                         if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
                     ]
-                    base_url, user, pwd, rel = upload_target
                     emit("⬆️ Upload kết quả age lên NAS...")
-                    _ensure_webdav_dir(base_url, rel, user, pwd)
-                    uploaded = _upload_outputs(
-                        Path(resolved["outputFolder"]),
-                        base_url,
-                        rel,
-                        user,
-                        pwd,
-                        pipeline,
-                    )
+                    if upload_target:
+                        base_url, user, pwd, rel = upload_target
+                        _ensure_webdav_dir(base_url, rel, user, pwd)
+                        uploaded = _upload_outputs(
+                            Path(resolved["outputFolder"]),
+                            base_url,
+                            rel,
+                            user,
+                            pwd,
+                            pipeline,
+                        )
+                    else:
+                        uploaded = _copy_outputs_to_smb(
+                            Path(resolved["outputFolder"]),
+                            smb_upload_target,
+                            pipeline,
+                        )
                     if uploaded != len(expected_names):
                         raise FastPathError(
-                            "PUT được %d/%d ảnh lên NAS." % (uploaded, len(expected_names))
+                            "Đã chuyển %d/%d ảnh lên NAS." % (uploaded, len(expected_names))
                         )
-                    verified = _verify_uploaded_outputs(
-                        Path(resolved["outputFolder"]),
-                        base_url,
-                        rel,
-                        user,
-                        pwd,
-                        expected_names,
-                    )
+                    if upload_target:
+                        verified = _verify_uploaded_outputs(
+                            Path(resolved["outputFolder"]),
+                            base_url,
+                            rel,
+                            user,
+                            pwd,
+                            expected_names,
+                        )
+                    else:
+                        verified = _verify_smb_outputs(
+                            Path(resolved["outputFolder"]),
+                            smb_upload_target,
+                            expected_names,
+                        )
                     emit("✅ Đã upload và xác nhận %d ảnh age trên NAS." % verified)
                 except Exception as exc:
                     status = "UPLOAD_ERROR"
@@ -1433,37 +1557,51 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                     tail = (proc.stdout or "").strip()[-1200:]
                     success = proc.returncode == 0 and status == "OK"
                 final_returncode = proc.returncode
-                if success and upload_target:
+                if success and (upload_target or smb_upload_target):
                     try:
                         expected_names = [
                             f.name
                             for f in sorted(Path(resolved["outputFolder"]).iterdir())
                             if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
                         ]
-                        base_url, user, pwd, rel = upload_target
                         emit("⬆️ Upload kết quả lên NAS...")
-                        _ensure_webdav_dir(base_url, rel, user, pwd)
-                        uploaded = _upload_outputs(
-                            Path(resolved["outputFolder"]),
-                            base_url,
-                            rel,
-                            user,
-                            pwd,
-                            pipeline,
-                        )
+                        if upload_target:
+                            base_url, user, pwd, rel = upload_target
+                            _ensure_webdav_dir(base_url, rel, user, pwd)
+                            uploaded = _upload_outputs(
+                                Path(resolved["outputFolder"]),
+                                base_url,
+                                rel,
+                                user,
+                                pwd,
+                                pipeline,
+                            )
+                        else:
+                            uploaded = _copy_outputs_to_smb(
+                                Path(resolved["outputFolder"]),
+                                smb_upload_target,
+                                pipeline,
+                            )
                         if uploaded != len(expected_names):
                             raise FastPathError(
-                                "PUT được %d/%d ảnh lên NAS."
+                                "Đã chuyển %d/%d ảnh lên NAS."
                                 % (uploaded, len(expected_names))
                             )
-                        verified = _verify_uploaded_outputs(
-                            Path(resolved["outputFolder"]),
-                            base_url,
-                            rel,
-                            user,
-                            pwd,
-                            expected_names,
-                        )
+                        if upload_target:
+                            verified = _verify_uploaded_outputs(
+                                Path(resolved["outputFolder"]),
+                                base_url,
+                                rel,
+                                user,
+                                pwd,
+                                expected_names,
+                            )
+                        else:
+                            verified = _verify_smb_outputs(
+                                Path(resolved["outputFolder"]),
+                                smb_upload_target,
+                                expected_names,
+                            )
                         emit("✅ Đã upload và xác nhận %d ảnh trên NAS." % verified)
                     except Exception as exc:
                         status = "UPLOAD_ERROR"
