@@ -1363,6 +1363,42 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                 emit,
             )
             final_returncode = proc.returncode if proc is not None else 1
+            if success and upload_target:
+                try:
+                    expected_names = [
+                        f.name
+                        for f in sorted(Path(resolved["outputFolder"]).iterdir())
+                        if f.is_file() and f.suffix.lower() in _output_exts(pipeline)
+                    ]
+                    base_url, user, pwd, rel = upload_target
+                    emit("⬆️ Upload kết quả age lên NAS...")
+                    _ensure_webdav_dir(base_url, rel, user, pwd)
+                    uploaded = _upload_outputs(
+                        Path(resolved["outputFolder"]),
+                        base_url,
+                        rel,
+                        user,
+                        pwd,
+                        pipeline,
+                    )
+                    if uploaded != len(expected_names):
+                        raise FastPathError(
+                            "PUT được %d/%d ảnh lên NAS." % (uploaded, len(expected_names))
+                        )
+                    verified = _verify_uploaded_outputs(
+                        Path(resolved["outputFolder"]),
+                        base_url,
+                        rel,
+                        user,
+                        pwd,
+                        expected_names,
+                    )
+                    emit("✅ Đã upload và xác nhận %d ảnh age trên NAS." % verified)
+                except Exception as exc:
+                    status = "UPLOAD_ERROR"
+                    tail = "Upload error: " + str(exc)[-300:]
+                    final_returncode = 1
+                    success = False
         else:
             cfg = _build_config(job, resolved, script_dir)
             config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
