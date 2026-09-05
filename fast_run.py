@@ -181,6 +181,14 @@ class FastPathError(Exception):
     """Lỗi do fast-path không tự xử lý được — nên fallback về agent."""
 
 
+class FastPathCancelled(Exception):
+    """Người dùng đã /cancel trong lúc fast-path đang chạy."""
+
+
+def _cancel_requested() -> bool:
+    return (ROOT / ".cancel-flag").exists()
+
+
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(int(os.environ.get(name, str(default))), minimum)
@@ -669,6 +677,8 @@ def _upload_outputs(
     allowed = set(only_names) if only_names is not None else None
     count = 0
     for f in sorted(local_dir.iterdir()):
+        if _cancel_requested():
+            raise FastPathCancelled()
         if f.suffix.lower() not in exts:
             continue
         if allowed is not None and f.name not in allowed:
@@ -700,6 +710,8 @@ def _copy_outputs_to_smb(
     target_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for f in sorted(local_dir.iterdir()):
+        if _cancel_requested():
+            raise FastPathCancelled()
         if f.suffix.lower() not in exts:
             continue
         if allowed is not None and f.name not in allowed:
@@ -715,6 +727,8 @@ def _verify_smb_outputs(
     expected_names: List[str],
 ) -> int:
     """Xác nhận đủ file và đúng kích thước sau khi copy qua SMB."""
+    if _cancel_requested():
+        raise FastPathCancelled()
     if not expected_names:
         raise FastPathError("Không có file local để xác nhận copy lên NAS.")
     missing = []
@@ -799,6 +813,8 @@ def _verify_uploaded_outputs(
     expected_names: List[str],
 ) -> int:
     """Bắt buộc xác nhận đủ file và đúng kích thước trên NAS sau PUT."""
+    if _cancel_requested():
+        raise FastPathCancelled()
     if not expected_names:
         raise FastPathError("Không có file local để xác nhận upload trên NAS.")
     remote = _webdav_file_sizes(base_url, rel, user, pwd)
@@ -1437,6 +1453,10 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                                     % verified
                                 )
                                 batch_success = True
+                            except FastPathCancelled:
+                                cancelled = True
+                                batch_error = "đã huỷ trong lúc copy lên NAS"
+                                break
                             except Exception as exc:
                                 batch_error = "upload: %s" % str(exc)[-300:]
 
@@ -1492,7 +1512,11 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                 emit,
             )
             final_returncode = proc.returncode if proc is not None else 1
-            if success and (upload_target or smb_upload_target):
+            if _cancel_requested():
+                success = False
+                status = "CANCELLED"
+                final_returncode = 130
+            if success and (upload_target or smb_upload_target) and not _cancel_requested():
                 try:
                     expected_names = [
                         f.name
@@ -1537,6 +1561,11 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                             expected_names,
                         )
                     emit("✅ Đã upload và xác nhận %d ảnh age trên NAS." % verified)
+                except FastPathCancelled:
+                    status = "CANCELLED"
+                    tail = ""
+                    final_returncode = 130
+                    success = False
                 except Exception as exc:
                     status = "UPLOAD_ERROR"
                     tail = "Upload error: " + str(exc)[-300:]
@@ -1576,7 +1605,11 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                     tail = (proc.stdout or "").strip()[-1200:]
                     success = proc.returncode == 0 and status == "OK"
                 final_returncode = proc.returncode
-                if success and (upload_target or smb_upload_target):
+                if _cancel_requested():
+                    success = False
+                    status = "CANCELLED"
+                    final_returncode = 130
+                if success and (upload_target or smb_upload_target) and not _cancel_requested():
                     try:
                         expected_names = [
                             f.name
@@ -1622,6 +1655,11 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
                                 expected_names,
                             )
                         emit("✅ Đã upload và xác nhận %d ảnh trên NAS." % verified)
+                    except FastPathCancelled:
+                        status = "CANCELLED"
+                        tail = ""
+                        final_returncode = 130
+                        success = False
                     except Exception as exc:
                         status = "UPLOAD_ERROR"
                         tail = "Upload error: " + str(exc)[-300:]
