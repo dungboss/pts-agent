@@ -113,11 +113,28 @@ def _local_run_dir(pipeline: str) -> Path:
     return ROOT / "local-run" / pipeline
 
 
+def _clear_local_immutable_flags(path: Path) -> None:
+    """Gỡ macOS uchg flag trên cây tạm trước khi dọn local-run."""
+    if IS_WINDOWS or not path.exists():
+        return
+    chflags = shutil.which("chflags")
+    if not chflags:
+        return
+    try:
+        subprocess.run(
+            [chflags, "-R", "nouchg", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _rmtree_quiet(path: Path, retries: int = 5, delay: float = 0.5) -> None:
     """Xoá cả cây, thử lại vài lần — trên Windows file có thể bị khoá tạm thời
     (Photoshop còn mở, antivirus đang quét) làm rmtree(ignore_errors=True) fail
     im lặng và để lại thư mục cũ."""
     for _ in range(retries):
+        _clear_local_immutable_flags(path)
         shutil.rmtree(path, ignore_errors=True)
         if not path.exists():
             return
@@ -137,6 +154,7 @@ def _reset_local_dir(local_root: Path, emit: Optional[Callable[[str], None]] = N
         # nào xoá được để tránh dính file cũ của lần chạy trước.
         for entry in sorted(local_root.iterdir()):
             try:
+                _clear_local_immutable_flags(entry)
                 if entry.is_dir() and not entry.is_symlink():
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
@@ -147,7 +165,7 @@ def _reset_local_dir(local_root: Path, emit: Optional[Callable[[str], None]] = N
                 leftovers.append(entry.name)
         if leftovers and emit:
             emit(
-                "⚠️ Không xoá được %d file cũ trong local-run (đang bị khoá) — "
+                "⚠️ Không xoá được %d mục cũ trong local-run (đang bị khoá) — "
                 "chạy tiếp, có thể dính file cũ: %s"
                 % (len(leftovers), ", ".join(leftovers[:5]))
             )
@@ -570,7 +588,8 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
             and _is_nonempty_file(f)
         ):
             seen.add(f.name)
-            shutil.copy2(str(f), str(target_dir / f.name))
+            # copyfile không bê nguyên macOS uchg flag từ NAS sang local-run.
+            shutil.copyfile(str(f), str(target_dir / f.name))
             copied.append(f.name)
 
     for f in sorted(src.iterdir()):
@@ -599,7 +618,7 @@ def _copy_design(src: Path, dst: Path, name_filter: Optional[str] = None) -> Lis
             continue
         if needle and needle not in f.stem.casefold():
             continue
-        shutil.copy2(str(f), str(dst / f.name))
+        shutil.copyfile(str(f), str(dst / f.name))
         copied.append(f.name)
     if not copied:
         if name_filter:
