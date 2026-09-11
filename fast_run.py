@@ -50,6 +50,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -125,8 +126,28 @@ def _local_run_dir(pipeline: str) -> Path:
 
 
 def _clear_local_immutable_flags(path: Path) -> None:
-    """Gỡ macOS uchg flag trên cây tạm trước khi dọn local-run."""
-    if IS_WINDOWS or not path.exists():
+    """Gỡ thuộc tính "chống ghi/xoá" trên cây tạm trước khi dọn/ghi đè:
+    macOS uchg flag, hoặc Windows FILE_ATTRIBUTE_READONLY (file font tải từ
+    NAS hay bị set read-only — nếu không gỡ, rmtree/unlink và copyfile sẽ
+    PermissionError: [Errno 13])."""
+    if not path.exists():
+        return
+    if IS_WINDOWS:
+        # Windows: os.chmod bản đồ S_IWRITE với việc gỡ FILE_ATTRIBUTE_READONLY.
+        try:
+            for root, dirs, files in os.walk(path):
+                for name in dirs + files:
+                    try:
+                        p = Path(root) / name
+                        os.chmod(p, os.stat(p).st_mode | stat.S_IWRITE)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        except OSError:
+            pass
         return
     chflags = shutil.which("chflags")
     if not chflags:
@@ -613,8 +634,16 @@ def _copy_nas_template(src: Path, dst: Path) -> List[str]:
             and _is_nonempty_file(f)
         ):
             seen.add(f.name)
+            # File cũ còn sót trong local-run có thể dính read-only (Windows) —
+            # gỡ trước khi copyfile, không thì open(dst, 'wb') PermissionError.
+            dst = target_dir / f.name
+            if dst.exists():
+                try:
+                    os.chmod(dst, os.stat(dst).st_mode | stat.S_IWRITE)
+                except OSError:
+                    pass
             # copyfile không bê nguyên macOS uchg flag từ NAS sang local-run.
-            shutil.copyfile(str(f), str(target_dir / f.name))
+            shutil.copyfile(str(f), str(dst))
             copied.append(f.name)
 
     for f in sorted(src.iterdir()):
