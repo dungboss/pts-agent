@@ -1204,6 +1204,12 @@ def _config_summary(job: Dict, cfg: Dict) -> str:
     )
 
 
+def input_folder(job: Dict) -> str:
+    """Trả thư mục nguồn chính để đưa vào thông báo gửi về Telegram."""
+    field = "designFolder" if job.get("pipeline") == "mockup" else "templateFolder"
+    return str(job.get(field) or "(không xác định)")
+
+
 def _run_wrapper(script_dir: Path, pipeline: str, config_path: Path, timeout: int) -> _ProcResult:
     """Chạy wrapper đúng theo OS: run-<pipeline>.bat (Windows) hoặc run-<pipeline>.sh (macOS)."""
     if IS_WINDOWS:
@@ -1731,6 +1737,7 @@ def _run_local_workflow(job: Dict, log: Optional[Callable[[str], None]] = None) 
             lines.append("⛔ Đã huỷ — %s." % pipeline)
         else:
             lines.append("❌ Lỗi — %s (exit %s, done=%s)." % (pipeline, final_returncode, status or "MISSING"))
+        lines.append("Input folder: %s" % input_folder(job))
         lines.append("Output: %s" % report_output)
         if not success and final_returncode not in (0, 130) and tail:
             lines.append("Log (cuối):\n" + tail)
