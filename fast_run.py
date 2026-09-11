@@ -74,6 +74,17 @@ DATA_SOURCES = {
         "csv": "de_name.csv",
         "sheets": "https://docs.google.com/spreadsheets/d/10B0orImwHdhs8pe51LXYVXS5Z2WuJtayN4WKXNkDKiE/edit?gid=0#gid=0",
     },
+    # Đức tách theo giới tính: cùng 1 spreadsheet, khác tab (gid).
+    "duc-male": {
+        "label": "Đức Male",
+        "csv": "de_name.csv",
+        "sheets": "https://docs.google.com/spreadsheets/d/10B0orImwHdhs8pe51LXYVXS5Z2WuJtayN4WKXNkDKiE/edit?gid=742997822#gid=742997822",
+    },
+    "duc-female": {
+        "label": "Đức Female",
+        "csv": "de_name.csv",
+        "sheets": "https://docs.google.com/spreadsheets/d/10B0orImwHdhs8pe51LXYVXS5Z2WuJtayN4WKXNkDKiE/edit?gid=51380776#gid=51380776",
+    },
 }
 
 PIPELINE_DIRS = {"tri": "tri-script", "age": "age-script", "mockup": "mockup-script"}
@@ -279,9 +290,15 @@ def _name_length_filter(text: str) -> Optional[int]:
 
 def _source_label(text: str) -> Optional[str]:
     low = text.lower()
+    is_duc = bool(re.search(r"\b(đức|duc|germany|de)\b", low))
+    # "Đức Male" / "Đức Female" phải kiểm tra trước "duc" để không match nhầm về "duc".
+    if re.search(r"\b(male|maile|nam)\b", low):
+        return "duc-male" if is_duc else None
+    if re.search(r"\b(female|femal|nữ|nu)\b", low):
+        return "duc-female" if is_duc else None
     if re.search(r"\b(pháp|phap|france|fr)\b", low):
         return "phap"
-    if re.search(r"\b(đức|duc|germany|de)\b", low):
+    if is_duc:
         return "duc"
     return None
 
