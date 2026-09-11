@@ -240,6 +240,40 @@ def _progress_message() -> Optional[str]:
     return "%s: đã chạy %d/%d (%d%%)." % (project["label"], done, total, pct)
 
 
+def _input_folder_for_project(key: str) -> Optional[str]:
+    """Đọc thư mục nguồn của pipeline đang chạy để đưa vào tin tiến trình."""
+    with _fastpath_state_lock:
+        running_job = _fastpath_running_job if _fastpath_running == key else None
+    if running_job is not None and fast_run is not None:
+        return fast_run.input_folder(running_job)
+
+    project = PROJECTS[key]
+    pdir = _project_dir(project)
+    field = "designFolder" if key == "mockup" else "templateFolder"
+    # Ưu tiên config gốc của fast-path để không gửi đường dẫn local-run tạm.
+    primary_paths = [
+        pdir / (".fastpath-%s-config.json" % key),
+        pdir / project["config"],
+    ]
+    primary_paths = sorted(
+        (path for path in primary_paths if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    config_paths = primary_paths + [pdir / (".%s-config-resolved.json" % key)]
+    for path in config_paths:
+        if not path.is_file():
+            continue
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        value = config.get(field)
+        if value:
+            return str(value)
+    return None
+
+
 WRAPPER_PATTERNS = ["run-tri.sh", "run-age.sh", "run-mockup.sh"]
 OSASCRIPT_PATTERNS = ["tri-script.jsx", "age-script.jsx", "mockup-script.jsx"]
 PHOTOSHOP_PATTERN = "Adobe Photoshop 2025.app/Contents/MacOS/Adobe Photoshop 2025"
@@ -503,9 +537,11 @@ def _start_progress_monitor(ai_agent: "DeepSeekAgent") -> None:
                         if elapsed >= interval and now - state["last_sent"] >= interval:
                             message = _progress_message()
                             if message:
-                                ai_agent.telegram_api.send_message(
-                                    owner, "📊 %s (đã %d phút)" % (message, int(elapsed) // 60)
-                                )
+                                input_folder = _input_folder_for_project(key)
+                                notification = "📊 %s (đã %d phút)" % (message, int(elapsed) // 60)
+                                if input_folder:
+                                    notification = "Input folder: %s\n%s" % (input_folder, notification)
+                                ai_agent.telegram_api.send_message(owner, notification)
                                 state["last_sent"] = now
                                 _save_last_owner(owner)
             except Exception:
@@ -524,7 +560,11 @@ def status_message(ai_agent: Optional["DeepSeekAgent"], chat_id: int) -> str:
         lines.append("Hàng đợi: " + ("%d việc đang chờ." % pending if pending else "trống."))
     running = _detect_running_project()
     if running is not None:
-        lines.append("Script: " + (_progress_message() or "%s đang chạy." % PROJECTS[running]["label"]))
+        progress = _progress_message() or "%s đang chạy." % PROJECTS[running]["label"]
+        input_folder = _input_folder_for_project(running)
+        if input_folder:
+            lines.append("Input folder: " + input_folder)
+        lines.append("Script: " + progress)
     else:
         lines.append("Script: không có script nào đang chạy.")
     with _fastpath_state_lock:
@@ -558,7 +598,7 @@ Workspace của bạn là project hiện tại. Ba pipeline là age-script, mock
 
 Cách hỏi: đưa thẳng các câu hỏi cần trả lời, ngắn gọn, đánh số. KHÔNG mở đầu bằng lời giải thích dài dòng kiểu "Chưa chạy được vì thiếu config...", "theo hướng dẫn AGENTS.md tôi bắt buộc phải hỏi", và KHÔNG liệt kê mục "Tình trạng hiện tại" trước câu hỏi.
 
-Bạn có thể dùng các tool local của Harness trong workspace để đọc file, xem log và chạy wrapper. Chỉ chạy run-age.sh/run-mockup.sh/run-tri.sh sau khi người dùng xác nhận; không chạy shell tùy ý ngoài phạm vi project. Nếu người dùng gửi sẵn đầy đủ cấu hình (template, nguồn, output, limit…) trong tin nhắn, hãy ghi config rồi chạy wrapper NGAY — không đọc lại AGENTS.md, không ls/khám phá thêm, không hỏi lại. Nếu người dùng chỉ hỏi chuyện thông thường, trả lời tự nhiên. Khi job hoàn tất, chỉ báo NGẮN GỌN (1–3 dòng): ✅/❌ + tên pipeline + số ảnh đã xử lý (x/tổng) + exit code/done + đường dẫn output. KHÔNG viết dài dòng, KHÔNG thêm mục "lưu ý nhỏ" / "sự cố gặp phải" — chỉ nêu lỗi/ghi chú khi có lỗi thật sự hoặc người dùng yêu cầu chi tiết. Sau mỗi lần chạy xong, xoá các file tạm (._* và *.sb-*) trong thư mục output. Sau khi người dùng /cancel, KHÔNG được tự chạy lại wrapper, không tự mở/activate Photoshop (kể cả qua osascript hay open) — chỉ báo đã huỷ và chờ lệnh mới. Nếu nguồn (template/design) nằm trên NAS, hãy tải về local trước rồi chạy local, sau đó upload kết quả lên NAS — không để Photoshop đọc/ghi trực tiếp qua WebDAV. Với lệnh chạy tri đã đủ config (template/output/formula/limit), ưu tiên gọi ./run-pipeline.sh "<toàn bộ lệnh>" để chạy gộp trong 1 bước thay vì gọi nhiều tool.
+Bạn có thể dùng các tool local của Harness trong workspace để đọc file, xem log và chạy wrapper. Chỉ chạy run-age.sh/run-mockup.sh/run-tri.sh sau khi người dùng xác nhận; không chạy shell tùy ý ngoài phạm vi project. Nếu người dùng gửi sẵn đầy đủ cấu hình (template, nguồn, output, limit…) trong tin nhắn, hãy ghi config rồi chạy wrapper NGAY — không đọc lại AGENTS.md, không ls/khám phá thêm, không hỏi lại. Nếu người dùng chỉ hỏi chuyện thông thường, trả lời tự nhiên. Khi job hoàn tất, chỉ báo NGẮN GỌN (1–4 dòng): ✅/❌ + tên pipeline + số ảnh đã xử lý (x/tổng) + exit code/done + input folder + đường dẫn output. Luôn ghi rõ input folder: với mockup là designFolder, với tri/age là templateFolder. KHÔNG viết dài dòng, KHÔNG thêm mục "lưu ý nhỏ" / "sự cố gặp phải" — chỉ nêu lỗi/ghi chú khi có lỗi thật sự hoặc người dùng yêu cầu chi tiết. Sau mỗi lần chạy xong, xoá các file tạm (._* và *.sb-*) trong thư mục output. Sau khi người dùng /cancel, KHÔNG được tự chạy lại wrapper, không tự mở/activate Photoshop (kể cả qua osascript hay open) — chỉ báo đã huỷ và chờ lệnh mới. Nếu nguồn (template/design) nằm trên NAS, hãy tải về local trước rồi chạy local, sau đó upload kết quả lên NAS — không để Photoshop đọc/ghi trực tiếp qua WebDAV. Với lệnh chạy tri đã đủ config (template/output/formula/limit), ưu tiên gọi ./run-pipeline.sh "<toàn bộ lệnh>" để chạy gộp trong 1 bước thay vì gọi nhiều tool.
 """
 
 
@@ -767,6 +807,7 @@ class DeepSeekAgent:
 
 FASTPATH_QUEUE: "queue.Queue[Tuple[TelegramAPI, int, Dict[str, Any]]]" = queue.Queue()
 _fastpath_running: Optional[str] = None  # pipeline fast-path đang chạy (None = rảnh)
+_fastpath_running_job: Optional[Dict[str, Any]] = None
 _fastpath_state_lock = threading.Lock()
 # Queue fast-path được lưu thêm trên đĩa để restart bot KHÔNG mất job đang chờ.
 FASTPATH_QUEUE_FILE = ROOT / ".fastpath-queue.json"
@@ -812,12 +853,13 @@ def _fp_queue_pop_first() -> None:
 
 def _fastpath_worker() -> None:
     """Worker chạy tuần tự từng job fast-path trong hàng đợi (mỗi lần 1 job)."""
-    global _fastpath_running
+    global _fastpath_running, _fastpath_running_job
     while True:
         api, chat_id, job = FASTPATH_QUEUE.get()
         _fp_queue_pop_first()  # job này bắt đầu chạy — bỏ khỏi file chờ
         with _fastpath_state_lock:
             _fastpath_running = job["pipeline"]
+            _fastpath_running_job = job
         try:
             _run_fastpath(api, chat_id, job)
         except Exception:
@@ -825,6 +867,7 @@ def _fastpath_worker() -> None:
         finally:
             with _fastpath_state_lock:
                 _fastpath_running = None
+                _fastpath_running_job = None
             FASTPATH_QUEUE.task_done()
 
 
@@ -845,6 +888,12 @@ def clear_fastpath_queue() -> int:
 
 def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
     """Chạy 1 job fast-path (được worker gọi tuần tự)."""
+    def with_input_folder(message: str) -> str:
+        """Đảm bảo mọi tin fast-path gửi trong lúc chạy có thư mục nguồn."""
+        if "Input folder:" in message:
+            return message
+        return "Input folder: %s\n%s" % (fast_run.input_folder(job), message)
+
     stop_progress = threading.Event()
     interval = env_int("TELEGRAM_PROGRESS_INTERVAL_SEC", 300, 10)
     started = time.time()
@@ -856,7 +905,10 @@ def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
                 continue
             elapsed = int(time.time() - started) // 60
             try:
-                api.send_message(chat_id, "📊 %s (đã %d phút)" % (message, elapsed))
+                api.send_message(
+                    chat_id,
+                    with_input_folder("📊 %s (đã %d phút)" % (message, elapsed)),
+                )
             except Exception:
                 logging.exception("Fast-path progress send failed")
 
@@ -865,16 +917,22 @@ def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
     try:
         def send(msg: str) -> None:
             try:
-                for chunk in split_message(msg):
+                for chunk in split_message(with_input_folder(msg)):
                     api.send_message(chat_id, chunk)
             except Exception:
                 logging.exception("Fast-path gửi Telegram lỗi")
 
         report = fast_run.run_job(job, log=send)
-        for chunk in split_message(report):
+        for chunk in split_message(with_input_folder(report)):
             api.send_message(chat_id, chunk)
     except fast_run.FastPathError as exc:
-        api.send_message(chat_id, "⚠️ Fast-path không chạy được: %s\nBạn có thể gửi lại để agent xử lý." % exc)
+        api.send_message(
+            chat_id,
+            with_input_folder(
+                "⚠️ Fast-path không chạy được: %s\n"
+                "Bạn có thể gửi lại để agent xử lý." % exc
+            ),
+        )
     finally:
         stop_progress.set()
 
@@ -965,9 +1023,17 @@ def handle_update(
             with _fastpath_state_lock:
                 pos = FASTPATH_QUEUE.qsize() + (1 if _fastpath_running else 0)
             if pos <= 1:
-                api.send_message(chat_id, "🚀 Fast-path: chạy %s (không qua AI)." % job["pipeline"].upper())
+                api.send_message(
+                    chat_id,
+                    "Input folder: %s\n🚀 Fast-path: chạy %s (không qua AI)."
+                    % (fast_run.input_folder(job), job["pipeline"].upper()),
+                )
             else:
-                api.send_message(chat_id, "🚀 Fast-path: đã xếp hàng %s (không qua AI). Vị trí: %d." % (job["pipeline"].upper(), pos))
+                api.send_message(
+                    chat_id,
+                    "Input folder: %s\n🚀 Fast-path: đã xếp hàng %s (không qua AI). Vị trí: %d."
+                    % (fast_run.input_folder(job), job["pipeline"].upper(), pos),
+                )
             return
     if ai_agent is None:
         api.send_message(chat_id, "Chưa cấu hình DEEPSEEK_API_KEY hoặc deepseek-harness-sdk nên agent chưa hoạt động.")

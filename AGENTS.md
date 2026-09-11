@@ -41,7 +41,7 @@ Khi báo kết quả chạy xong, chỉ gửi **1–3 dòng** ngắn gọn, ví 
 ✅ Xong — mockup: 2/2 ảnh, exit OK. Output: [NAS]/NAME/DE/tri44/mockup
 ```
 
-Gồm đúng: ✅/❌ + tên pipeline + số đã xử lý (x/tổng) + exit/done + đường dẫn output.
+Gồm đúng: ✅/❌ + tên pipeline + số đã xử lý (x/tổng) + exit/done + input folder + đường dẫn output.
 KHÔNG viết dài dòng, KHÔNG thêm mục "lưu ý nhỏ" / "sự cố gặp phải" / liệt kê config —
 chỉ nêu lỗi hoặc ghi chú khi có lỗi thật sự hoặc người dùng yêu cầu chi tiết.
 
