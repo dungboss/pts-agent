@@ -7,7 +7,8 @@ chat và dùng tool trong workspace (đọc file, chạy wrapper, ...) y hệt k
 trực tiếp với Harness. Khi agent trả lời, câu trả lời được gửi về Telegram.
 
 Không còn wizard /run tri|age|mockup hay các lệnh pipeline — mọi tin nhắn đều
-đi thẳng tới agent. Chỉ giữ /reset để xóa lịch sử hội thoại AI của chat.
+đi thẳng tới agent. Giữ /reset để xóa lịch sử hội thoại AI và /restart để dừng
+job, xoá vùng local-run rồi bắt đầu lại sạch ở lần chạy kế tiếp.
 
 Phần Telegram chỉ dùng Python standard library; cần deepseek-harness-sdk trong
 .venv (xem requirements.txt).
@@ -886,6 +887,26 @@ def clear_fastpath_queue() -> int:
     return cleared
 
 
+def clear_local_run() -> bool:
+    """Xoá toàn bộ thư mục local-run dùng làm vùng tạm cho pipeline.
+
+    Chỉ gọi sau khi đã dừng wrapper/Photoshop; lần chạy kế tiếp sẽ tự tạo lại
+    các thư mục cần thiết và tải lại template mới từ NAS.
+    """
+    local_root = ROOT / "local-run"
+    if not local_root.exists():
+        return True
+    try:
+        if fast_run is not None:
+            fast_run._rmtree_quiet(local_root)  # type: ignore[attr-defined]
+        else:
+            shutil.rmtree(local_root)
+    except (OSError, AttributeError):
+        logging.exception("Không xoá được local-run")
+        return False
+    return not local_root.exists()
+
+
 def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
     """Chạy 1 job fast-path (được worker gọi tuần tự)."""
     def with_input_folder(message: str) -> str:
@@ -976,6 +997,26 @@ def handle_update(
         return
 
     command, _args = parse_command(text)
+    if command == "restart":
+        # Dừng mọi tiến trình trước khi xoá snapshot local; nếu không, Photoshop
+        # hoặc wrapper cũ có thể tiếp tục đọc/ghi lại template cũ vào local-run.
+        try:
+            CANCEL_FLAG.touch()
+        except OSError:
+            pass
+        if ai_agent is not None:
+            ai_agent.hard_cancel(chat_id)
+        stopped = cancel_running_script()
+        cleared = clear_fastpath_queue()
+        threading.Thread(target=_photoshop_watchdog, daemon=True).start()
+        local_cleared = clear_local_run()
+        parts = ["Đã restart: xoá local-run %s." % ("OK" if local_cleared else "thất bại")]
+        if stopped:
+            parts.append("Đã dừng: %s." % ", ".join(stopped))
+        if cleared:
+            parts.append("Đã bỏ %d việc đang xếp hàng." % cleared)
+        api.send_message(chat_id, " ".join(parts))
+        return
     if command == "reset":
         if ai_agent is not None:
             ai_agent.reset(chat_id)
