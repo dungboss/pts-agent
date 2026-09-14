@@ -7,8 +7,8 @@ chat và dùng tool trong workspace (đọc file, chạy wrapper, ...) y hệt k
 trực tiếp với Harness. Khi agent trả lời, câu trả lời được gửi về Telegram.
 
 Không còn wizard /run tri|age|mockup hay các lệnh pipeline — mọi tin nhắn đều
-đi thẳng tới agent. Giữ /reset để xóa lịch sử hội thoại AI và /restart để dừng
-job, xoá vùng local-run rồi bắt đầu lại sạch ở lần chạy kế tiếp.
+đi thẳng tới agent. Giữ /reset để xóa lịch sử hội thoại AI và /restart để pull
+code mới, dừng job, xoá vùng local-run rồi bắt đầu lại sạch ở lần chạy kế tiếp.
 
 Phần Telegram chỉ dùng Python standard library; cần deepseek-harness-sdk trong
 .venv (xem requirements.txt).
@@ -907,6 +907,22 @@ def clear_local_run() -> bool:
     return not local_root.exists()
 
 
+def git_pull_before_restart() -> Tuple[bool, str]:
+    """Cập nhật workspace trước khi /restart xoá snapshot local."""
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    detail = (result.stdout or result.stderr or "").strip().splitlines()
+    return result.returncode == 0, (detail[-1] if detail else "")
+
+
 def _run_fastpath(api: TelegramAPI, chat_id: int, job: Dict[str, Any]) -> None:
     """Chạy 1 job fast-path (được worker gọi tuần tự)."""
     def with_input_folder(message: str) -> str:
@@ -998,6 +1014,7 @@ def handle_update(
 
     command, _args = parse_command(text)
     if command == "restart":
+        pull_ok, pull_detail = git_pull_before_restart()
         # Dừng mọi tiến trình trước khi xoá snapshot local; nếu không, Photoshop
         # hoặc wrapper cũ có thể tiếp tục đọc/ghi lại template cũ vào local-run.
         try:
@@ -1010,7 +1027,14 @@ def handle_update(
         cleared = clear_fastpath_queue()
         threading.Thread(target=_photoshop_watchdog, daemon=True).start()
         local_cleared = clear_local_run()
-        parts = ["Đã restart: xoá local-run %s." % ("OK" if local_cleared else "thất bại")]
+        pull_status = "OK" if pull_ok else "thất bại"
+        parts = [
+            "git pull %s%s." % (
+                pull_status,
+                (" (" + pull_detail + ")") if pull_detail else "",
+            ),
+            "Đã restart: xoá local-run %s." % ("OK" if local_cleared else "thất bại"),
+        ]
         if stopped:
             parts.append("Đã dừng: %s." % ", ".join(stopped))
         if cleared:
